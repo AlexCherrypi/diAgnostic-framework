@@ -35,8 +35,11 @@ Browser: <http://localhost:5173>
 
 ### Desktop-Shell (natives Fenster)
 
+Einfachster Weg: **`START.bat` doppelklicken** (startet Core + Fenster).
+Manuell:
+
 ```powershell
-backend\.venv\Scripts\python.exe -m pip install pywebview
+backend\.venv\Scripts\python.exe -m pip install -e "backend[desktop]"
 backend\.venv\Scripts\python.exe shell\run_desktop.py
 ```
 

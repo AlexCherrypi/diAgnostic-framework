@@ -20,6 +20,9 @@ dev = [
     "pytest-asyncio",
     "httpx",
 ]
+desktop = [
+    "pywebview",
+]
 
 [tool.setuptools.packages.find]
 include = ["diagcore*"]
