@@ -1,0 +1,17 @@
+# toolchain / environments (portable node + gh live here)
+tools/
+backend/.venv/
+frontend/node_modules/
+
+# build output
+frontend/dist/
+backend/**/__pycache__/
+*.egg-info/
+*.pyc
+.pytest_cache/
+
+# editor / os
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

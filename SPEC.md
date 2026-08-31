@@ -1,0 +1,417 @@
+# diAgnostic-framework — Skeleton Specification (M0)
+
+A manufacturer-independent platform skeleton for building automotive diagnostic
+tools. This document is the **binding contract** between backend, frontend and
+plugins. Anything ambiguous here must be resolved by updating this file first.
+
+Scope of M0: everything visual, organizational and backend-generic.
+**Nothing vehicle-specific.** Vehicle/VCI/database specifics arrive later as
+plugins (e.g. the existing `oleodiag` PSA library becomes a plugin bundle).
+
+---
+
+## 1. Core principles
+
+1. **The backend is the single source of truth.** The frontend is a pure
+   renderer: it mirrors backend state and sends *intents* (commands). It never
+   computes domain state itself.
+2. **Every backend object is visible.** All meaningful backend state lives in
+   one **state tree** of typed nodes. If it isn't in the tree, the frontend
+   cannot show it — so put it in the tree.
+3. **Every node type has a frontend component** (or falls back to a generic
+   renderer). Every component must render **all** node statuses, including
+   `error` and `gone`. A component that crashes while rendering must degrade to
+   an inline error card, never take down the app.
+4. **Fault isolation.** Plugins run out-of-process. A crashing plugin marks its
+   subtree `error`; the core and the UI keep running.
+5. **No silent failure.** No bare `except:`. Every failure ends up as an
+   `error` status + structured error info on some node.
+
+## 2. Process model
+
+```
+┌────────────────────┐  WebSocket (state + telemetry)   ┌──────────────────┐
+│  Frontend (web)    │◄────────────────────────────────►│  Core (Python    │
+│  React + TS, pure  │      commands →                  │  3.14, asyncio,  │
+│  renderer          │                                  │  FastAPI)        │
+└────────────────────┘                                  └───┬──────────────┘
+   runs in browser (dev) or pywebview window (desktop)      │ JSON-RPC over stdio
+                                                 ┌──────────┴───────────┐
+                                                 │ Plugin processes     │
+                                                 │ (any Python, even    │
+                                                 │  32-bit for old DLLs)│
+                                                 └──────────────────────┘
+```
+
+- **Core**: Python ≥3.13 (64-bit, developed on 3.14), asyncio, FastAPI + uvicorn, pydantic v2.
+  Owns the state tree, job engine, telemetry hub, plugin supervisor.
+- **Plugins**: separate OS processes, spawned and supervised by the core,
+  speaking JSON-RPC 2.0 (line-delimited) over stdio. stderr = plugin log.
+- **Frontend**: Vite + React + TypeScript (strict), zustand mirror store,
+  uPlot charts. Dev: browser at Vite dev server. Prod: built `dist/` served by
+  the core; optional pywebview shell opens a native window.
+
+Ports: core listens on `127.0.0.1:8765`. Vite dev server `5173`, proxying
+`/ws` and `/api` (with `ws: true`) to the core.
+
+## 3. State tree
+
+### 3.1 Node model
+
+```jsonc
+{
+  "id": "string, unique, opaque",
+  "type": "dotted.lowercase, e.g. 'plugin', 'device.sim', 'telemetry.channel', 'job', 'job.step'",
+  "name": "human-readable label",
+  "status": "init | idle | running | done | error | cancelled | gone",
+  "error": { "message": "string", "detail": "string?" },   // or null
+  "progress": 0.0,          // 0..1 or null
+  "props": { },             // type-specific data, JSON object
+  "actions": [              // commands the UI may offer generically
+    { "name": "selftest", "label": "Run self-test", "params": [] }
+  ],
+  "parentId": "string|null (null only for root)",
+  "children": ["ordered", "child", "ids"],
+  "owner": "core | plugin:<pluginId>"
+}
+```
+
+Status semantics:
+
+| status      | meaning                                                       |
+|-------------|---------------------------------------------------------------|
+| `init`      | created, not ready yet (e.g. job queued, plugin starting)     |
+| `idle`      | ready, nothing running                                        |
+| `running`   | actively doing something (may carry `progress`)               |
+| `done`      | finished successfully (terminal)                              |
+| `error`     | failed / crashed; `error` field is set (terminal until reset) |
+| `cancelled` | stopped by user request (terminal)                            |
+| `gone`      | no longer available; UI shows it dimmed or removes it         |
+
+### 3.2 Well-known nodes (created by the core at startup)
+
+```
+root (type "root")
+├── system  (type "system")   props: { version, startedAt, pythonVersion }
+├── plugins (type "plugins")  children: one "plugin" node per configured plugin
+└── jobs    (type "jobs")     children: "job" nodes, newest first
+```
+
+Plugin nodes have id `plugin:<pluginId>` and own their subtree: everything a
+plugin declares is attached under its plugin node (devices, channels, …).
+Jobs are owned by the core job engine and live under `jobs`.
+
+> **M0 resolution (recorded per the rule at the top of this file):** §6
+> restricts plugin mutations to the plugin's own subtree and offers no
+> job-creation RPC, while §9 requires the demo plugin to run jobs. Jobs
+> *triggered by a plugin* therefore live as `job` / `job.step` nodes *inside
+> that plugin's subtree*, declared via ordinary §6 notifications and
+> mirroring the §7 semantics (steps, progress, sorted named locks, `cancel`).
+> The `jobs` node holds core-created jobs only. A core-side job RPC that
+> moves plugin-triggered jobs under `jobs` (and unifies the lock table, see
+> §7) is deferred to a later milestone.
+
+### 3.3 Storage & patches
+
+The tree is stored flat: `{ rootId: string, nodes: { [id]: Node } }`.
+Every mutation increments a global sequence number `seq` (monotonic int) and
+is broadcast as one of three ops:
+
+```jsonc
+{ "op": "add",    "node": { ...full Node incl. parentId } }
+  // insert node; append id to parent's children (or at "index" if given)
+{ "op": "update", "id": "x", "changes": { ...partial Node } }
+  // top-level keys in changes REPLACE the node's keys ("props" replaces all props)
+{ "op": "merge_props", "id": "x", "props": { ...partial } }
+  // shallow-merge into node.props (cheap single-value updates)
+{ "op": "remove", "id": "x" }
+  // remove node and all descendants; remove id from parent's children
+```
+
+## 4. State WebSocket — `/ws/state`
+
+Server → client:
+
+```jsonc
+{ "t": "hello", "seq": 42, "snapshot": { "rootId": "root", "nodes": { } } }
+{ "t": "patch", "seq": 43, "ops": [ ...ops from 3.3 ] }
+{ "t": "cmd_result", "cmdId": "c1", "ok": true, "data": { } }
+{ "t": "cmd_result", "cmdId": "c1", "ok": false, "error": { "message": "..." } }
+```
+
+Client → server:
+
+```jsonc
+{ "t": "cmd", "cmdId": "c1", "target": "<nodeId>", "action": "selftest", "params": { } }
+{ "t": "resync" }   // ask for a fresh hello (sent after a detected seq gap)
+```
+
+Rules:
+- On connect the server immediately sends `hello`.
+- Patches carry consecutive `seq`; if the client sees a gap it sends `resync`.
+- Commands are routed by the **owner** of the target node: `core` handles its
+  own (e.g. `cancel` on jobs, `restart` on dead plugin nodes), plugin-owned
+  nodes are forwarded to the plugin via RPC. Unknown target/action → `ok:false`.
+- The frontend reconnects automatically (exponential backoff, 0.5 s → 10 s cap)
+  and shows connection state in the UI at all times.
+
+## 5. Telemetry WebSocket — `/ws/telemetry`
+
+High-rate numeric samples bypass the state tree. A node of type
+`telemetry.channel` *describes* a channel (props: `unit`, `label`,
+`sampleRateHz`, optional `min`/`max`); the samples flow here.
+
+Client → server: `{ "t": "sub", "channel": "<nodeId>" }` / `{ "t": "unsub", ... }`
+
+Server → client:
+
+```jsonc
+{ "t": "history", "channel": "<id>", "samples": [[tMs, value], ...] }  // on sub, ring buffer content
+{ "t": "samples", "channel": "<id>", "samples": [[tMs, value], ...] }  // batched, flushed every 100 ms
+```
+
+Timestamps are Unix epoch **milliseconds** (float ok). The core keeps a ring
+buffer per channel (default 10 000 samples).
+
+## 6. Plugin protocol (JSON-RPC 2.0, line-delimited, over stdio)
+
+Core spawns: `<python> <entry from manifest>` with cwd = plugin dir.
+One JSON object per line on stdin/stdout. stderr lines are logged by the host.
+
+Core → plugin (requests):
+- `initialize {pluginNodeId, config}` → result `{ok: true}` — plugin then declares its nodes
+- `command {target, action, params}` → result `{ok, data?, error?}`
+- `ping {}` → result `{}` (heartbeat; every 2 s, timeout 5 s)
+- `shutdown {}` → result `{}` then process exits
+
+Plugin → core (notifications):
+- `add {node}` / `update {id, changes}` / `merge_props {id, props}` / `remove {id}`
+  — mutations restricted to the plugin's own subtree; violations are logged and dropped
+- `samples {channel, samples: [[tMs, v], ...]}`
+- `log {level, message}`
+
+There is deliberately no job-creation RPC in M0: jobs triggered by a plugin
+are ordinary nodes in the plugin's subtree — see the M0 resolution in §3.2.
+
+Supervision policy:
+- Heartbeat timeout or process exit ⇒ plugin node + all descendants get
+  `status: "error"`, error `{message: "plugin process died"}`.
+- Automatic restart with backoff (1 s, 3 s, 10 s), max 3 attempts, then the
+  plugin node stays `error` and offers action `restart`.
+- On successful restart the old subtree is removed and re-declared.
+
+Manifest (`manifest.json` in the plugin directory):
+
+```jsonc
+{
+  "id": "demo_vci",
+  "name": "Demo VCI (simulated)",
+  "version": "0.1.0",
+  "entry": "plugin.py",
+  "python": "default",        // or an absolute path, e.g. a 32-bit interpreter
+  "frontend": null            // reserved for M1: plugin-shipped component bundles
+}
+```
+
+## 7. Job engine (core)
+
+- Anything long-running is a **job**: a node of type `job` under `jobs`, with
+  child `job.step` nodes for nested/complex flows (steps may nest further).
+- API (backend-internal): `jobs.create(name, coro_factory, locks=[...]) -> Job`.
+  The coro receives a `JobContext` with `ctx.step(name)` (async context manager
+  creating a running step node), `ctx.set_progress(0..1)`, and honours
+  `asyncio.CancelledError` for cancellation.
+- **Resource locks**: named exclusive locks (e.g. `"bus:demo_vci"`). Acquired
+  in sorted order before the job starts (deadlock-free). While waiting, the job
+  node is `init` with `props.waitingFor = [lockNames]`.
+  **M0 scope:** locks are exclusive *per owner process* — the core engine's
+  lock table and each plugin process's lock table (see §3.2) are separate
+  namespaces, so a core job and a plugin job using the same lock name do
+  **not** exclude each other. Cross-owner exclusivity arrives with the job
+  RPC deferred in §3.2.
+- Every job node has action `cancel` while `init`/`running` ⇒ status `cancelled`.
+- Job failure ⇒ `error` on the job node **and** on the step that failed; the
+  core never crashes because of a job.
+- **Retention**: the engine keeps the newest 50 *terminal* jobs and removes
+  older terminal job nodes (with their steps), so a long-running core does not
+  accumulate them forever; plugin-side jobs apply the same cap per plugin.
+
+## 8. Frontend architecture
+
+- **Mirror store** (zustand): `{ connection, seq, rootId, nodes }` — mutated
+  *only* by `hello`/`patch` messages. Hook `useNode(id)` selects one node.
+- **Component registry**: maps `type` → React component. Resolution: exact
+  match, then longest dotted prefix (`job.step` → `job`), then `GenericNode`.
+  `GenericNode` renders name, type, status badge, error, progress, props table,
+  action buttons and nested children — so *any* backend object is usable in
+  the UI with zero frontend work.
+- **StatusFrame**: every node component is wrapped in a frame that renders the
+  status (badge/border), the error card for `error`, dimming for `gone`, and a
+  per-node React error boundary (render crash ⇒ inline error card).
+- **Actions**: buttons generated from `node.actions`, sending `cmd` and
+  reflecting pending/result state.
+- **Charts**: uPlot. `ChannelChart` subscribes to `/ws/telemetry` on mount,
+  unsubscribes on unmount, keeps a client-side ring buffer, renders a rolling
+  time window (default 60 s) plus a large current-value readout. Updates are
+  rAF-throttled. Current values are always shown *with* their recent history.
+- **Layout**: header (app name, connection state, system info) · left sidebar
+  (full tree explorer) · main panel (selected node rendered via registry;
+  default selection = root).
+- **Design**: clean dev-tool aesthetic. CSS custom properties, dark theme
+  default, light via `prefers-color-scheme`. System font stack (offline-safe).
+  Status colors: idle=neutral, running=blue (subtle animation), done=green,
+  error=red, cancelled=amber, gone=dimmed. UI strings in English (i18n is a
+  later milestone).
+
+## 9. Demo plugin `demo_vci` (proves the skeleton, still car-unspecific)
+
+Declares under its plugin node:
+- Device node `device.sim` "Simulated VCI", status `idle`, with actions:
+  - `selftest` — job with 4 nested steps, ~8 s total, progress, cancellable,
+    uses lock `bus:demo_vci`
+  - `selftest_fail` — same but step 3 raises ⇒ demonstrates error propagation
+  - `crash` — hard-kills the plugin process (`os._exit(1)`) ⇒ demonstrates
+    supervisor + subtree `error` + restart
+- Three `telemetry.channel` children at 20 Hz: sine (`V`), noise (`rpm`),
+  sawtooth (`°C`).
+
+## 10. Repository layout
+
+```
+C:\diAgnostic-framework\
+  SPEC.md                    ← this contract
+  README.md
+  .gitignore
+  backend\
+    pyproject.toml           ← project "diagcore", deps: fastapi, uvicorn[standard],
+    .venv\                     pydantic>=2, websockets; dev: pytest, pytest-asyncio, httpx
+    diagcore\
+      __init__.py  model.py  tree.py  bus.py  jobs.py  telemetry.py
+      server.py    app.py    __main__.py      ← `python -m diagcore`
+      plugins\ host.py  api.py  manifest.py   ← api.py = helper lib for plugin authors
+    plugins\demo_vci\ manifest.json  plugin.py
+    tests\                   ← pytest; includes a real-WebSocket smoke test
+  frontend\
+    package.json  vite.config.ts  tsconfig*  index.html
+    src\ main.tsx App.tsx
+         lib\ types.ts ws.ts store.ts commands.ts telemetry.ts
+         registry\ registry.tsx
+         components\ StatusFrame.tsx GenericNode.tsx TreeExplorer.tsx
+                     JobView.tsx DeviceView.tsx ChannelChart.tsx ...
+  shell\run_desktop.py       ← optional pywebview window (serves built dist)
+  scripts\ dev-backend.ps1 dev-frontend.ps1 build.ps1 test.ps1
+  tools\node\                ← portable Node 24 LTS (git-ignored)
+```
+
+The core serves `frontend/dist` at `/` when it exists (single-process prod).
+
+## 11. Toolchain on this machine
+
+- Python 3.14 (64-bit): launcher `py -3.14`. A 32-bit 3.12 exists for future
+  legacy-DLL plugins — **not** used by the core.
+- Node: **not on PATH.** Portable install at `C:\diAgnostic-framework\tools\node`
+  (node.exe, npm.cmd). Prepend it to PATH in every shell that needs npm/npx.
+- Backend venv: `C:\diAgnostic-framework\backend\.venv` (create with `py -3.14 -m venv`).
+
+## 12. Conventions
+
+- Code, comments, identifiers, commit messages: English.
+- Python: pydantic v2 models, full type hints, `from __future__ import annotations`,
+  no bare `except:` (narrow exceptions; last resort `except Exception` with
+  structured error reporting to the tree).
+- TypeScript: `strict: true`, no `any` unless unavoidable at the WS boundary
+  (parse into typed messages immediately).
+- Tests must pass via `scripts\test.ps1`; frontend must typecheck + build via
+  `scripts\build.ps1`.
+
+## 13. Milestones (beyond M0 — out of scope now, design for them)
+
+- **M0.5**: audit logging & raw feeds — see §14. **Next increment.**
+- **M1**: plugin-shipped frontend bundles (manifest `frontend` field; dynamic
+  import; e.g. camera stream with overlay), served at `/plugin-assets/<id>/`.
+- **M1.5**: generic vehicle-session concepts (manufacturer-agnostic): vehicle
+  profile store (detect a new vehicle vs. reuse a previously detected one),
+  generic ECU-discovery flow, "probe arbitrary ECU" — as node types + generic
+  components; plugins fill in the manufacturer-specific behavior.
+- **M2**: persistence (sessions, recorded telemetry), bug-report export
+  (zipped session logs).
+- **M3**: packaging/installer (Tauri or PyInstaller + pywebview), auto-update.
+- **M4**: i18n; first real vehicle plugin (wrap `oleodiag` as `plugin:psa`).
+
+---
+
+## 14. M0.5 — Audit logging & raw feeds  ⚠ NOT part of the M0 build
+
+Two platform laws, added to §1 in spirit and enforced by this layer:
+
+- **Nothing is invisible.** Every backend actor — down to an adapter driver —
+  has a node in the tree and therefore a place in the UI where its crash or
+  state change is *seen* (§1.2 already guarantees this; M0.5 adds the history).
+- **Nothing happens without a log.** Every action in the program, and above
+  all every exchange with the vehicle, is logged automatically and completely,
+  **always including the raw data** (read *and* write), so any session can be
+  reconstructed 1:1 afterwards (wrong coding written to a car, bug reports,
+  "why is it stuck at 10 %?").
+
+### 14.1 LogHub (core)
+
+Structured event:
+
+```jsonc
+{
+  "ts": 1735e12,            // unix ms
+  "n": 123,                 // monotonic event number (per session)
+  "level": "trace | debug | info | warn | error",
+  "source": "core | plugin:<id>",
+  "nodeId": "string|null",  // the node this event belongs to (subtree filtering)
+  "category": "cmd | state | io | job | plugin | system",
+  "message": "human-readable, but NEVER only a label — always ids + values",
+  "data": { },              // decoded/structured payload (optional)
+  "raw": "hex string"       // raw bytes when applicable (optional)
+}
+```
+
+Sinks:
+- **Session file** `logs/session-<start-ts>.jsonl` — *complete*, every event,
+  unbounded, flushed promptly. This is the audit trail.
+- **In-memory ring** (50 000 events) serving the UI.
+
+Logged **automatically by the core at the seams** (plugin authors get this for
+free): every received command (target id, action, full raw params, result);
+every state patch (category `state`, level `trace`, update diffs included);
+job lifecycle incl. steps, progress milestones, cancellation, errors; plugin
+lifecycle (spawn, heartbeat timeout, exit code, restart attempts); every
+plugin RPC line in/out (level `trace`).
+
+### 14.2 Raw vehicle I/O
+
+New plugin → core notification:
+
+```jsonc
+{ "method": "io", "params": { "nodeId": "<device/channel node>",
+  "direction": "tx | rx", "raw": "hex", "decoded": { }, "note": "string?" } }
+```
+
+**Law:** every byte exchanged with a vehicle MUST be reported via `io` —
+the plugin helper lib makes this a one-liner. `io` events land in the LogHub
+(category `io`) and in the per-node raw feed. The demo plugin simulates bus
+traffic during its jobs so the feed is demonstrable without hardware.
+
+### 14.3 Log WebSocket — `/ws/logs`
+
+Client → server: `{ "t": "sub", "filter": { "nodeId": "x"?, "levels": []?,
+"categories": []?, "search": "..."? } }` (nodeId filters the whole subtree),
+`{ "t": "unsub" }`. Server → client: `{ "t": "history", "events": [...] }`
+(recent matching events on sub), `{ "t": "events", "events": [...] }` (live,
+batched ≤10/s).
+
+### 14.4 Frontend
+
+- **Global log panel**: collapsible bottom drawer; live tail with pause/resume
+  autoscroll; filters (level, category, subtree, text search); monospace; raw
+  hex shown alongside decoded data; copyable.
+- **Per-node raw feed**: every node component (via StatusFrame) gets a "Raw"
+  expander showing the log/io feed filtered to that node's subtree — the
+  "is it looping or actually working?" view.
+- **Never a bare wait state**: long operations show progress/ETA when known;
+  when unknowable, the raw feed is always one click away.

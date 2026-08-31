@@ -1,0 +1,8 @@
+{
+    "id": "demo_vci",
+    "name": "Demo VCI (simulated)",
+    "version": "0.1.0",
+    "entry": "plugin.py",
+    "python": "default",
+    "frontend": null
+}
