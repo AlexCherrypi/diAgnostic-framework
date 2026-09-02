@@ -18,3 +18,6 @@ backend/**/__pycache__/
 .idea/
 Thumbs.db
 .DS_Store
+
+# runtime data (vehicle profiles etc., M1.5)
+data/

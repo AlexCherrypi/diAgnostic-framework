@@ -70,13 +70,34 @@ tests next to the running desktop app: `python -m diagcore --port <n>` or env
   "progress": 0.0,          // 0..1 or null
   "props": { },             // type-specific data, JSON object
   "actions": [              // commands the UI may offer generically
-    { "name": "selftest", "label": "Run self-test", "params": [] }
+    { "name": "selftest", "label": "Run self-test", "params": [] },
+    { "name": "probe", "label": "Probe ECU", "confirm": "string?",  // optional confirmation text
+      "params": [ /* see 3.1.1 */ ] }
   ],
   "parentId": "string|null (null only for root)",
   "children": ["ordered", "child", "ids"],
   "owner": "core | plugin:<pluginId>"
 }
 ```
+
+#### 3.1.1 Action parameters (M1.5)
+
+Each entry of `actions[].params` describes one input the UI collects before
+sending the command:
+
+```jsonc
+{ "name": "address", "label": "ECU address",
+  "type": "string | number | boolean | select",
+  "required": true, "default": null, "placeholder": "0x10", "help": "string?",
+  "min": 0, "max": 255,                                        // number only
+  "options": [ { "value": "uds", "label": "UDS on CAN" } ] }   // select only
+```
+
+Rules: the UI sends `params` as `{ name: value }` using the option **value**,
+never its label — so the audit trail (§14) records the raw value/id behind
+every dropdown choice. A non-empty `params` list opens the generic action
+form (§8); an action with `confirm` asks before sending; an action without
+params sends `{}`.
 
 Status semantics:
 
@@ -96,7 +117,9 @@ Status semantics:
 root (type "root")
 ├── system  (type "system")   props: { version, startedAt, pythonVersion, auditFile }
 ├── plugins (type "plugins")  children: one "plugin" node per configured plugin
-└── jobs    (type "jobs")     children: "job" nodes, newest first
+├── jobs    (type "jobs")     children: "job" nodes, newest first
+├── vehicle  (type "vehicle.session")  the active vehicle — M1.5, §15.2
+└── vehicles (type "vehicle.library")  known vehicle profiles — M1.5, §15.3
 ```
 
 `auditFile` (M0.5) is the path of the session audit file (§14.1), or `null`
@@ -198,12 +221,17 @@ Core → plugin (requests):
 - `command {target, action, params}` → result `{ok, data?, error?}`
 - `ping {}` → result `{}` (heartbeat; every 2 s, timeout 5 s)
 - `shutdown {}` → result `{}` then process exits
+- `vehicle.detect {sessionNodeId, params}` / `vehicle.attach {sessionNodeId, profile}`
+  / `vehicle.detach {sessionNodeId}` — M1.5, only for plugins with capability
+  `vehicle`; see §15.4
 
 Plugin → core (notifications):
 - `add {node}` / `update {id, changes}` / `merge_props {id, props}` / `remove {id}`
-  — mutations restricted to the plugin's own subtree; violations are logged and dropped
+  — mutations restricted to the plugin's own subtree **plus subtrees explicitly
+  granted to it (mount grants, §15.4)**; violations are logged and dropped
 - `samples {channel, samples: [[tMs, v], ...]}`
 - `log {level, message}`
+- `io {...}` (M0.5, §14.2) · `vehicle.profile {sessionNodeId, profile}` (M1.5, §15.4)
 
 There is deliberately no job-creation RPC in M0: jobs triggered by a plugin
 are ordinary nodes in the plugin's subtree — see the M0 resolution in §3.2.
@@ -224,7 +252,9 @@ Manifest (`manifest.json` in the plugin directory):
   "version": "0.1.0",
   "entry": "plugin.py",
   "python": "default",        // or an absolute path, e.g. a 32-bit interpreter
-  "frontend": null            // reserved for M1: plugin-shipped component bundles
+  "frontend": null,           // reserved for M1: plugin-shipped component bundles
+  "capabilities": ["vehicle"],          // M1.5: optional; "vehicle" ⇒ implements §15.4
+  "vehicle": { "detectParams": [] }     // M1.5: optional extra params for `detect` (§3.1.1)
 }
 ```
 
@@ -350,6 +380,7 @@ The core serves `frontend/dist` at `/` when it exists (single-process prod).
   profile store (detect a new vehicle vs. reuse a previously detected one),
   generic ECU-discovery flow, "probe arbitrary ECU" — as node types + generic
   components; plugins fill in the manufacturer-specific behavior.
+  **Specified in §15 — pulled ahead of M1 (next increment, backend 0.3.0).**
 - **M2**: persistence (sessions, recorded telemetry), bug-report export
   (zipped session logs).
 - **M3**: packaging/installer (Tauri or PyInstaller + pywebview), auto-update.
@@ -381,7 +412,7 @@ Structured event:
   "level": "trace | debug | info | warn | error",
   "source": "core | plugin:<id>",
   "nodeId": "string|null",  // the node this event belongs to (subtree filtering)
-  "category": "cmd | state | io | job | plugin | system",
+  "category": "cmd | state | io | job | plugin | system | vehicle",   // vehicle: M1.5 session lifecycle & grants
   "message": "human-readable, but NEVER only a label — always ids + values",
   "data": { },              // decoded/structured payload (optional)
   "raw": "hex string"       // raw bytes when applicable (optional)
@@ -467,3 +498,139 @@ global log panel therefore never lets the last category be deselected.
   "is it looping or actually working?" view.
 - **Never a bare wait state**: long operations show progress/ETA when known;
   when unknowable, the raw feed is always one click away.
+
+---
+
+## 15. M1.5 — Generic vehicle session  ⚠ next increment (backend 0.3.0)
+
+Manufacturer-agnostic answers to "which vehicle am I talking to?": detect a
+new vehicle, reuse a previously detected one, see its ECUs, probe an
+arbitrary ECU. The **core owns the concepts and the persistence**; a plugin
+with capability `vehicle` supplies the manufacturer-specific **behavior**
+(how to scan a bus, how to talk to an ECU). Everything stays visible (§1.2),
+logged (§14) and job-shaped (§7).
+
+### 15.1 Vehicle profile (persisted by the core)
+
+```jsonc
+{
+  "id": "veh_<random>",              // core-assigned, opaque
+  "name": "Demo Vehicle",            // display name (plugin-proposed, user-renamable)
+  "vin": "string|null",
+  "identifiers": { },                // plugin-defined, opaque to the core
+  "pluginId": "demo_vci",            // the plugin able to attach this vehicle
+  "firstSeen": 1735e12, "lastSeen": 1735e12,          // unix ms
+  "ecus": [ { "id": "stable within the profile", "name": "Engine ECU",
+              "address": "string", "protocol": "string", "props": { } } ],
+  "notes": ""
+}
+```
+
+Stored as one JSON file per profile in `<data dir>/vehicles/<id>.json`
+(data dir default `<repo>/data`, override `DIAGCORE_DATA_DIR`; git-ignored).
+Upsert key: `pluginId` + `vin` when a VIN is known, else `pluginId` +
+canonical JSON of `identifiers`. Writes are atomic (temp file + replace).
+Load errors mark the library node `error` (with action `reload`) — never
+crash the core. Every profile create/update/forget is logged (category
+`vehicle`) with the full profile in `data`.
+
+### 15.2 Session node `vehicle` (core-owned, type `vehicle.session`)
+
+props `{ state: "none | detecting | attaching | connected | lost", profileId,
+name, vin, pluginId, ecuCount, since }`. Status mapping: `idle` for
+none/connected, `running` for detecting/attaching, `error` for lost (plugin
+died or detach failed; `error` set).
+
+Actions — only the applicable ones are present at any time:
+- `detect` (states none/connected/lost): params = `plugin` (select over the
+  plugins with capability `vehicle`; omitted when exactly one) + that plugin's
+  manifest `vehicle.detectParams`. Starts detection (§15.4).
+- `disconnect` (states detecting/attaching/connected/lost): cancels a running
+  detect/attach, sends `vehicle.detach`, removes the session subtree.
+
+Children: while detecting/attaching, the plugin's job (`job`/`job.step`)
+declared **under the session node** so progress, steps and the raw feed appear
+*at the vehicle*; while connected, the plugin's `ecu` nodes and tool nodes.
+All of these are plugin-owned via a mount grant (§15.4).
+
+### 15.3 Library node `vehicles` (core-owned, type `vehicle.library`)
+
+One child `vehicle.profile` node per stored profile (id `vehicle:<profileId>`,
+ordered by `lastSeen` desc). props = the profile without full `ecus`
+(`ecuCount` + compact `ecus` summary `[{id, name, address}]`). Actions:
+`select` (attach via the profile's plugin; `ok:false` with reason while a
+session is detecting/attaching or the plugin is not running), `rename`
+(params `name` string), `forget` (`confirm` set; deletes the file). Library
+status `idle`; `error` with action `reload` if the store failed to load.
+
+### 15.4 Plugin side — capability `vehicle`
+
+Manifest: `"capabilities": ["vehicle"]`, optional
+`"vehicle": { "detectParams": [ …§3.1.1 params… ] }`.
+
+**Mount grants.** The core grants the plugin the right to mutate under the
+session node: implied by `vehicle.detect` / `vehicle.attach` for
+`sessionNodeId`, revoked by `vehicle.detach`, by the core removing the session
+subtree, or by a plugin restart. The host enforces §6 as "own subtree ∪
+granted subtrees"; grants and revocations are logged (category `vehicle`).
+
+Core → plugin requests:
+- `vehicle.detect {sessionNodeId, params}` → `{ok, jobNodeId?, error?}`.
+  The plugin runs a detection **job under the session node** (steps,
+  progress, `io` frames, cancellable via the job's `cancel`), declares `ecu`
+  nodes under the session node as they are found, and finally sends
+  `vehicle.profile`. If the job ends `error`/`cancelled`, the core returns the
+  session to `none`, removes the subtree, revokes the grant, and logs why.
+- `vehicle.attach {sessionNodeId, profile}` → `{ok, jobNodeId?, error?}`:
+  re-declare the profile's `ecu` nodes (optionally after a short verification
+  job) so a known vehicle is reused without a full scan; a mismatch is
+  reported through the job's error and handled like a failed detect.
+- `vehicle.detach {sessionNodeId}` → `{ok}`: the plugin releases the vehicle.
+  The core removes the subtree and revokes the grant even if the plugin does
+  not answer (timeout 5 s ⇒ logged `warn`).
+
+Plugin → core notification:
+- `vehicle.profile {sessionNodeId, profile}` — profile per §15.1 without
+  `id`/`firstSeen`/`lastSeen` (the core fills them). The core upserts the
+  file, refreshes the library node and sets the session `connected` with
+  `profileId`. May be sent again later (more identifiers learned) ⇒ upsert.
+
+`ecu` node (plugin-owned, type `ecu`): props `{ ecuId (= profile ecu id),
+address, protocol, … }`, status `idle` when reachable, `error` when not;
+plugin-defined actions (e.g. `read_ids`, `probe`) are ordinary §6 commands,
+so the audit trail has target id, params and result for every one of them.
+
+### 15.5 Frontend
+
+- `VehicleSessionView` (type `vehicle.session`) — the hero of the app.
+  none → prominent "Detect vehicle" (action form when params exist) plus a
+  compact "Known vehicles" list with one-click connect; detecting/attaching →
+  the job rendered inline (progress, steps, raw feed) with cancel; connected →
+  summary (name, VIN, plugin, since, ECU count), ECU grid and tool nodes via
+  the registry, disconnect; lost → error card with the ways out.
+- `VehicleLibraryView` / `VehicleProfileView`: cards (name, VIN, last seen,
+  ECU count, plugin) with Connect · Rename · Forget (confirm).
+- `EcuView` (type `ecu`): compact card — name, address, protocol, status,
+  actions; the Raw expander comes from StatusFrame as everywhere.
+- **Generic action form** (§3.1.1): generated from `params` (text, number with
+  min/max, checkbox, select from options), validates `required`, sends
+  `{ name: value }`; `confirm` prompts first. Used by GenericNode and every
+  specific view alike.
+- The `vehicle` node is the default selection on connect (instead of root), so
+  the first screen answers "which vehicle?".
+
+### 15.6 Demo plugin additions (fictive, manufacturer-free)
+
+- Capability `vehicle`; detect param `depth` (select `quick` / `full`).
+- Detection job (~6 s quick, ~12 s full): steps "Wake diagnostic bus", "Scan
+  addresses 0x00–0x7F" (progress per address, simulated request/response `io`
+  frames, 5 addresses answer), "Read identification" (per ECU), "Build
+  profile". Always yields the same fictive vehicle (name "Demo Vehicle", VIN
+  `DEM0VEH1CLE000042`), so the *second* run demonstrates "known vehicle →
+  attach" through the library.
+- Declares 5 `ecu` nodes (Engine, Body, Brakes, Airbag, Cluster), each with
+  action `read_ids` (short job filling props), plus one tool node `ecu.probe`
+  "Probe ECU" with action `probe` — params `address` (string, e.g. `0x2A`) and
+  `protocol` (select UDS/KWP): known addresses answer (result data + `io`
+  frames), unknown ones time out after ~1.5 s ⇒ `ok:false` with reason.
+- `attach` runs a ~2 s "Verify ECUs present" job.
