@@ -51,8 +51,10 @@ plugins (e.g. the existing `oleodiag` PSA library becomes a plugin bundle).
   uPlot charts. Dev: browser at Vite dev server. Prod: built `dist/` served by
   the core; optional pywebview shell opens a native window.
 
-Ports: core listens on `127.0.0.1:8765`. Vite dev server `5173`, proxying
-`/ws` and `/api` (with `ws: true`) to the core.
+Ports: core listens on `127.0.0.1:8765` (override for a second instance, e.g.
+tests next to the running desktop app: `python -m diagcore --port <n>` or env
+`DIAGCORE_PORT`; the flag wins). Vite dev server `5173`, proxying `/ws` and
+`/api` (with `ws: true`) to the core.
 
 ## 3. State tree
 
@@ -92,10 +94,18 @@ Status semantics:
 
 ```
 root (type "root")
-├── system  (type "system")   props: { version, startedAt, pythonVersion }
+├── system  (type "system")   props: { version, startedAt, pythonVersion, auditFile }
 ├── plugins (type "plugins")  children: one "plugin" node per configured plugin
 └── jobs    (type "jobs")     children: "job" nodes, newest first
 ```
+
+`auditFile` (M0.5) is the path of the session audit file (§14.1), or `null`
+if it could not be opened. If the audit file fails at any time (open error,
+disk full, directory removed) the `system` node goes `status: "error"` with
+error `{message: "audit session file disabled", detail}` and gains
+`props.auditFileError` — the trail's outage is itself visible in the UI
+(§1.5); `/api/health` then reports `ok: false` plus `auditFile` /
+`auditFileError`.
 
 Plugin nodes have id `plugin:<pluginId>` and own their subtree: everything a
 plugin declares is attached under its plugin node (devices, channels, …).
@@ -110,6 +120,11 @@ Jobs are owned by the core job engine and live under `jobs`.
 > The `jobs` node holds core-created jobs only. A core-side job RPC that
 > moves plugin-triggered jobs under `jobs` (and unifies the lock table, see
 > §7) is deferred to a later milestone.
+> **M0.5 addendum:** plugin-side job ids are unique per plugin *process
+> incarnation* (`<pluginNodeId>:job:<incarnation>.<n>`), never reused after a
+> crash/restart — the log ring (§14.1) keeps events across restarts, and a
+> reused id would merge two unrelated jobs in a per-node feed (§14.4). Ids
+> stay opaque (§3.1); nothing may parse them.
 
 ### 3.3 Storage & patches
 
@@ -282,11 +297,13 @@ C:\diAgnostic-framework\
   SPEC.md                    ← this contract
   README.md
   .gitignore
+  logs\                      ← M0.5 session audit files session-<ts>.jsonl (git-ignored, §14.1)
   backend\
     pyproject.toml           ← project "diagcore", deps: fastapi, uvicorn[standard],
     .venv\                     pydantic>=2, websockets; dev: pytest, pytest-asyncio, httpx
     diagcore\
       __init__.py  model.py  tree.py  bus.py  jobs.py  telemetry.py
+      loghub.py                                ← M0.5 audit LogHub (§14.1)
       server.py    app.py    __main__.py      ← `python -m diagcore`
       plugins\ host.py  api.py  manifest.py   ← api.py = helper lib for plugin authors
     plugins\demo_vci\ manifest.json  plugin.py
@@ -326,7 +343,7 @@ The core serves `frontend/dist` at `/` when it exists (single-process prod).
 
 ## 13. Milestones (beyond M0 — out of scope now, design for them)
 
-- **M0.5**: audit logging & raw feeds — see §14. **Next increment.**
+- **M0.5**: audit logging & raw feeds — see §14. **Implemented as of v0.2.**
 - **M1**: plugin-shipped frontend bundles (manifest `frontend` field; dynamic
   import; e.g. camera stream with overlay), served at `/plugin-assets/<id>/`.
 - **M1.5**: generic vehicle-session concepts (manufacturer-agnostic): vehicle
@@ -340,7 +357,7 @@ The core serves `frontend/dist` at `/` when it exists (single-process prod).
 
 ---
 
-## 14. M0.5 — Audit logging & raw feeds  ⚠ NOT part of the M0 build
+## 14. M0.5 — Audit logging & raw feeds  ✅ implemented as of v0.2 (backend `diagcore` 0.2.0)
 
 Two platform laws, added to §1 in spirit and enforced by this layer:
 
@@ -373,15 +390,35 @@ Structured event:
 
 Sinks:
 - **Session file** `logs/session-<start-ts>.jsonl` — *complete*, every event,
-  unbounded, flushed promptly. This is the audit trail.
-- **In-memory ring** (50 000 events) serving the UI.
+  unbounded, flushed promptly. This is the audit trail. Its failure is never
+  silent: the core keeps running on the ring, records one ring-only
+  `system`/`error` event and flags the `system` node (§3.2).
+- **In-memory ring** serving the UI: **50 000 events or 64 MiB of serialized
+  events, whichever cap is hit first** (oldest evicted first) — a plugin
+  pushing large props at high rate must not grow the core without bound.
+
+Text hygiene: strings are Unicode. Lone UTF-16 surrogates (not valid text;
+typically bytes decoded with `errors="surrogateescape"` that crossed the
+plugin's JSON boundary as `\uDxxx` escapes) are escaped (`backslashreplace`,
+byte value stays visible) at the plugin ingress and again at `emit`, so one
+bad string can neither disable the session file nor kill a WebSocket sender.
+A socket whose sender fails is closed (code 1011) and the drop is audited —
+never a connected-but-deaf client.
 
 Logged **automatically by the core at the seams** (plugin authors get this for
-free): every received command (target id, action, full raw params, result);
-every state patch (category `state`, level `trace`, update diffs included);
-job lifecycle incl. steps, progress milestones, cancellation, errors; plugin
+free): every received command (target id, action, full raw params — any JSON
+value, a non-object is rejected `ok:false` *after* being logged — result,
+plus `cmdId` and the issuing `client` connection in both events so concurrent
+commands pair up unambiguously); every state patch (category `state`, level
+`trace`, update diffs included); job lifecycle incl. steps, progress
+milestones, cancellation, errors — for plugin-side jobs also the terminal
+`failed: plugin process died` event when the plugin dies mid-job; plugin
 lifecycle (spawn, heartbeat timeout, exit code, restart attempts); every
-plugin RPC line in/out (level `trace`).
+plugin RPC line in/out (level `trace`), **except two incoming
+notifications**: `samples` (telemetry is never routed through the LogHub — it
+would flood it; the `io` category is exclusively for vehicle frames) and `io`
+(captured once as its category-`io` event with nodeId, direction, raw hex,
+decoded and note; the JSON-RPC envelope is not trace-logged a second time).
 
 ### 14.2 Raw vehicle I/O
 
@@ -397,6 +434,16 @@ the plugin helper lib makes this a one-liner. `io` events land in the LogHub
 (category `io`) and in the per-node raw feed. The demo plugin simulates bus
 traffic during its jobs so the feed is demonstrable without hardware.
 
+Rules (M0.5 resolution, recorded per the rule at the top of this file):
+- `nodeId` must lie in the plugin's own subtree (same rule as the §6
+  mutations); violations are logged (level `warn`, category `plugin`, source
+  `plugin:<id>`, full params in `data`) and dropped.
+- `raw` is the frame as **whole bytes in hex** (`frame.hex()`: even length,
+  no `0x` prefix, no separators; whitespace between bytes is tolerated and
+  stripped) so the trail replays byte-exact via `bytes.fromhex`. Anything
+  else is dropped with the same `warn` event. The core's own `LogEvent.raw`
+  is held to the same rule.
+
 ### 14.3 Log WebSocket — `/ws/logs`
 
 Client → server: `{ "t": "sub", "filter": { "nodeId": "x"?, "levels": []?,
@@ -404,6 +451,11 @@ Client → server: `{ "t": "sub", "filter": { "nodeId": "x"?, "levels": []?,
 `{ "t": "unsub" }`. Server → client: `{ "t": "history", "events": [...] }`
 (recent matching events on sub), `{ "t": "events", "events": [...] }` (live,
 batched ≤10/s).
+
+Filter semantics: every field is optional and **an empty list is the same as
+an absent field — "no constraint"** (`categories: []` matches every
+category). A client that wants to show nothing must not subscribe; the
+global log panel therefore never lets the last category be deselected.
 
 ### 14.4 Frontend
 

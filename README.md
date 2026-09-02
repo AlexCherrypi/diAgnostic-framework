@@ -1,6 +1,7 @@
 # diAgnostic-framework
 
-Herstellerunabhängiges Plattform-**Skelett** für Kfz-Diagnosewerkzeuge (Milestone M0).
+Herstellerunabhängiges Plattform-**Skelett** für Kfz-Diagnosewerkzeuge
+(Milestones M0 + M0.5, Backend `diagcore` v0.2.0).
 Enthält alles Visuelle, Organisatorische und Backend-Generische — **nichts
 Fahrzeugspezifisches**. Fahrzeug-, VCI- und Datenbank-Logik kommt später als Plugins.
 
@@ -51,12 +52,70 @@ backend\.venv\Scripts\python.exe shell\run_desktop.py
 
 Zusätzlich gibt es einen Live-Smoke-Test gegen einen **laufenden** Core
 (Hello-Snapshot, Telemetrie, Selftest-Job, Fehlerpfad, Plugin-Crash+Restart,
-Cancel):
+Cancel sowie seit M0.5 der Audit-Log: `/ws/logs`-History und Live-Events,
+cmd-/job-/io-/state-Events, Teilbaum-Filter, Session-JSONL-Datei):
 
 ```powershell
 cd backend
-.venv\Scripts\python.exe tests\smoke_live.py
+.venv\Scripts\python.exe tests\smoke_live.py              # Core auf 8765
+.venv\Scripts\python.exe tests\smoke_live.py --port 8766  # oder $env:DIAGCORE_PORT
 ```
+
+## Audit-Log & Roh-Feed (M0.5, ab v0.2)
+
+Plattform-Gesetz aus SPEC §14: **Nichts passiert ohne Log.** Der Core
+protokolliert automatisch an seinen Nahtstellen — Plugin-Autoren müssen dafür
+nichts tun:
+
+- jedes empfangene Kommando: Ziel-Knoten-ID, Action, vollständige Parameter,
+  das Ergebnis sowie `cmdId` und die auslösende UI-Verbindung, damit sich
+  gleichzeitige Kommandos eindeutig zuordnen lassen (Kategorie `cmd`)
+- jeden State-Patch (`add`/`update`/`merge_props`/`remove`) inkl. Diff der
+  geänderten Werte (Kategorie `state`, Level `trace`)
+- den Job-Lebenszyklus: angelegt, Warten auf Locks, gestartet, Steps,
+  25/50/75-%-Meilensteine, Abbruch, Fehler, fertig (Kategorie `job`) — auch
+  für Plugin-seitige Jobs, inklusive `failed: plugin process died`, wenn das
+  Plugin mitten im Job stirbt
+- den Plugin-Lebenszyklus: Spawn (PID), Initialize, Heartbeat-Timeout,
+  Exit-Code, Restart-Versuche, verworfene Notifications, stderr-Zeilen sowie
+  jede JSON-RPC-Zeile rein/raus auf Level `trace` (Kategorie `plugin`) —
+  ausgenommen die eingehenden Notifications `samples` (Telemetrie) und `io`
+  (landet einmal als `io`-Event, nicht zusätzlich als Roh-Zeile)
+- **jeden Fahrzeug-Frame** (Kategorie `io`, immer mit Roh-Hex): ein Plugin
+  meldet ihn per `plugin.io(node_id, "tx" | "rx", raw_hex, decoded=..., note=...)`
+  — Gesetz aus SPEC §14.2: jedes Byte zum/vom Fahrzeug wird gemeldet, lesend
+  wie schreibend. `raw_hex` ist `frame.hex()` (ganze Bytes, kein `0x`, keine
+  Trenner); anderes wird verworfen und als `warn` geloggt. Das Demo-Plugin
+  simuliert dafür während seiner Self-Tests UDS-ähnliche Request/Response-Paare.
+- Core-Start/-Stopp und UI-Verbindungen zu `/ws/state` (Kategorie `system`)
+
+Telemetrie-Samples laufen bewusst **nicht** durch das Log (sie würden es
+fluten); die Kategorie `io` ist ausschließlich für Fahrzeug-Kommunikation.
+
+**Session-Dateien:** `logs\session-<Startzeit>.jsonl` (Verzeichnis wird beim
+Start angelegt, git-ignoriert) — ein JSON-Objekt pro Zeile, sofort geflusht,
+vollständig und unbegrenzt: der Audit-Trail, mit dem sich jede Sitzung 1:1
+rekonstruieren lässt (falsche Codierung, Bug-Report, „warum hängt es bei
+10 %?“). Der Pfad steht in `system.props.auditFile`; fällt die Datei aus
+(Platte voll, Verzeichnis weg), geht der `system`-Knoten auf `error`
+(`auditFileError`), `/api/health` meldet `ok: false`, und im Log erscheint
+genau ein `system`/`error`-Event — der Core läuft mit dem Ring weiter.
+Zusätzlich hält der Core einen Ring der letzten 50 000 Events (max. 64 MiB
+serialisiert) für die UI; Zugriff über den WebSocket `/ws/logs` (SPEC §14.3:
+`sub` mit Filter ⇒ `history` + gebündelte Live-`events`, ein Filter pro
+Verbindung; leere Listen bedeuten „keine Einschränkung“).
+
+**UI:** Das **Log-Panel** (einklappbare Leiste am unteren Rand) zeigt den
+Live-Tail mit Pause/Resume-Autoscroll und Filtern (Mindest-Level, Kategorien,
+Teilbaum = aktuell ausgewählter Knoten, Textsuche); jede Zeile lässt sich
+aufklappen (Meta, Daten-JSON, Hex-Block, Kopieren). Jeder Knoten hat in seinem
+StatusFrame einen **„Raw“-Expander** mit dem Log-/io-Feed seines Teilbaums —
+die „hängt es oder arbeitet es?“-Ansicht, immer einen Klick entfernt.
+
+**Port-Override:** Standard bleibt `127.0.0.1:8765`. Für eine zweite Instanz
+(z. B. Tests neben der laufenden Desktop-App): `python -m diagcore --port 8766`
+oder Umgebungsvariable `DIAGCORE_PORT=8766` (das Flag gewinnt). `smoke_live.py`
+liest dieselbe Variable (Fallback 8765).
 
 ## Architektur-Überblick
 
@@ -80,7 +139,7 @@ Details und alle Protokolle: [`SPEC.md`](SPEC.md).
 ```
 SPEC.md                      Vertrag (verbindlich)
 backend\
-  diagcore\                  Core: model, tree, bus, jobs, telemetry, server, app
+  diagcore\                  Core: model, tree, bus, jobs, telemetry, loghub, server, app
     plugins\                 host.py (Supervisor), api.py (Lib für Plugin-Autoren)
   plugins\demo_vci\          Demo-Plugin (simuliertes VCI)
   tests\                     pytest-Suite + smoke_live.py (Live-E2E)
@@ -91,6 +150,7 @@ frontend\
 shell\run_desktop.py         optionales pywebview-Fenster
 scripts\                     dev-backend / dev-frontend / build / test (PS 5.1)
 tools\node\                  portables Node (nicht im PATH, git-ignoriert)
+logs\                        Session-Audit-Dateien session-<ts>.jsonl (git-ignoriert)
 ```
 
 ## Eigenes Plugin schreiben (am Beispiel `demo_vci`)
@@ -155,9 +215,13 @@ Bausteine der API:
   `cancel`-Action. Semantik spiegelt SPEC §7, aber: die Job-Knoten liegen im
   Plugin-Teilbaum (nicht unter `jobs`) und die benannten Locks sind nur
   Plugin-lokal exklusiv — siehe die M0-Hinweise in SPEC §3.2/§6/§7.
-- `plugin.samples(channel_id, [[tMs, v], ...])` — Telemetrie in den Hub.
-- `plugin.log(level, message)` — Log über den Host; stderr wird ebenfalls
-  vom Host geloggt.
+- `plugin.samples(channel_id, [[tMs, v], ...])` — Telemetrie in den Hub
+  (bewusst nicht im Audit-Log).
+- `plugin.io(node_id, "tx" | "rx", raw_hex, decoded=None, note=None)` — jeden
+  Fahrzeug-Frame melden (Pflicht, SPEC §14.2); landet im Audit-Log
+  (Kategorie `io`, mit Roh-Hex) und im „Raw“-Feed des Knotens.
+- `plugin.log(level, message)` — Log über den Host (Audit-Log-Kategorie
+  `plugin`); stderr wird ebenfalls vom Host geloggt.
 - `plugin.create_task(coro)` — Hintergrund-Task (z. B. Telemetrie-Schleife).
 
 Der Core entdeckt das Plugin beim Start automatisch, spawnt den Prozess

@@ -58,6 +58,26 @@ def test_add_unknown_parent_raises(tree: StateTree) -> None:
         tree.add(make_node("a", "nope"))
 
 
+def test_is_within_matches_subtree_ids_membership(tree: StateTree) -> None:
+    tree.add(make_node("a", "root"))
+    tree.add(make_node("a1", "a"))
+    tree.add(make_node("a1x", "a1"))
+    tree.add(make_node("b", "root"))
+    for node_id in ("a", "a1", "a1x"):
+        assert tree.is_within(node_id, "a")
+        assert node_id in tree.subtree_ids("a")
+    assert not tree.is_within("b", "a") and "b" not in tree.subtree_ids("a")
+    assert not tree.is_within("root", "a")
+    assert tree.is_within("a1x", "root")
+    assert not tree.is_within(None, "a")
+    assert not tree.is_within("ghost", "a")
+    assert not tree.is_within("a", "ghost")  # ancestor must exist too
+    tree.remove("a1")
+    assert not tree.is_within("a1x", "a")  # removed subtree is gone
+    with pytest.raises(TypeError):
+        tree.is_within(["unhashable"], "a")  # type: ignore[arg-type]
+
+
 def test_add_second_root_raises(tree: StateTree) -> None:
     with pytest.raises(ValueError, match="root node already exists"):
         tree.add(make_node("root2", None, type="root"))

@@ -3,6 +3,9 @@ tools/
 backend/.venv/
 frontend/node_modules/
 
+# session audit logs (M0.5, SPEC 14.1)
+logs/
+
 # build output
 frontend/dist/
 backend/**/__pycache__/

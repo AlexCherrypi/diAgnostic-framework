@@ -3,11 +3,14 @@
  * that renders the status (badge + colored border), the error card for
  * `error`, dimming for `gone`, and a per-node React error boundary — a
  * render crash degrades to an inline error card, never takes down the app.
+ * Since M0.5 it also gives every node a "Raw" expander (SPEC 14.4) showing
+ * the log/io feed filtered to the node's subtree.
  */
 
 import { Component } from 'react'
 import type { ReactNode } from 'react'
 import type { DiagNode, NodeError, NodeStatus } from '../lib/types'
+import { RawExpander } from './RawFeed'
 
 const STATUS_LABEL: Record<NodeStatus, string> = {
   init: 'init',
@@ -93,6 +96,7 @@ export function StatusFrame({ node, children }: { node: DiagNode; children: Reac
       <div className="node-body">
         <NodeErrorBoundary nodeId={node.id}>{children}</NodeErrorBoundary>
       </div>
+      <RawExpander nodeId={node.id} />
     </section>
   )
 }

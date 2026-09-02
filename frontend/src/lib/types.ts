@@ -1,6 +1,7 @@
 /**
  * Wire types mirroring SPEC.md sections 3.1 (node model), 3.3 (patch ops),
- * 4 (state WebSocket) and 5 (telemetry WebSocket).
+ * 4 (state WebSocket), 5 (telemetry WebSocket) and 14.1/14.3 (log events
+ * and the log WebSocket).
  *
  * Field names are the contract — do not rename.
  */
@@ -171,6 +172,67 @@ export interface SamplesMsg {
 }
 
 export type TelemetryServerMsg = HistoryMsg | SamplesMsg
+
+// ---------------------------------------------------------------------------
+// 14.1 LogHub events & 14.3 log WebSocket — /ws/logs
+// ---------------------------------------------------------------------------
+
+export const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error'] as const
+export type LogLevel = (typeof LOG_LEVELS)[number]
+
+export const LOG_CATEGORIES = ['cmd', 'state', 'io', 'job', 'plugin', 'system'] as const
+export type LogCategory = (typeof LOG_CATEGORIES)[number]
+
+export interface LogEvent {
+  /** unix epoch milliseconds */
+  ts: number
+  /** monotonic event number (per session) */
+  n: number
+  level: LogLevel
+  source: NodeOwner
+  /** the node this event belongs to (subtree filtering), or null */
+  nodeId: string | null
+  category: LogCategory
+  /** human-readable, never only a label — always ids + values */
+  message: string
+  /** decoded/structured payload (optional) */
+  data?: Record<string, unknown>
+  /** raw bytes as hex string when applicable (optional) */
+  raw?: string
+}
+
+/** One active filter per /ws/logs connection; `nodeId` filters the whole subtree. */
+export interface LogFilter {
+  nodeId?: string
+  levels?: LogLevel[]
+  categories?: LogCategory[]
+  search?: string
+}
+
+export interface LogSubMsg {
+  t: 'sub'
+  filter: LogFilter
+}
+
+export interface LogUnsubMsg {
+  t: 'unsub'
+}
+
+export type LogsClientMsg = LogSubMsg | LogUnsubMsg
+
+/** Recent matching events, sent once after a `sub`. */
+export interface LogHistoryMsg {
+  t: 'history'
+  events: LogEvent[]
+}
+
+/** Live matching events, batched (≤10 batches/s). */
+export interface LogEventsMsg {
+  t: 'events'
+  events: LogEvent[]
+}
+
+export type LogsServerMsg = LogHistoryMsg | LogEventsMsg
 
 // ---------------------------------------------------------------------------
 // Frontend-local: connection state
@@ -382,6 +444,53 @@ export function parseStateServerMsg(data: unknown): StateServerMsg | null {
     default:
       return null
   }
+}
+
+/** Normalize one raw log event from the wire into a LogEvent, or null if unusable. */
+export function parseLogEvent(raw: unknown): LogEvent | null {
+  if (!isRecord(raw)) return null
+  if (typeof raw['ts'] !== 'number' || typeof raw['n'] !== 'number') return null
+  if (typeof raw['message'] !== 'string') return null
+  if (!LOG_LEVELS.includes(raw['level'] as LogLevel)) return null
+  if (!LOG_CATEGORIES.includes(raw['category'] as LogCategory)) return null
+  const source = asString(raw['source'], 'core')
+  const ev: LogEvent = {
+    ts: raw['ts'],
+    n: raw['n'],
+    level: raw['level'] as LogLevel,
+    source: (source === 'core' || source.startsWith('plugin:') ? source : 'core') as NodeOwner,
+    nodeId: typeof raw['nodeId'] === 'string' ? raw['nodeId'] : null,
+    category: raw['category'] as LogCategory,
+    message: raw['message'],
+  }
+  if (isRecord(raw['data'])) ev.data = raw['data']
+  if (typeof raw['raw'] === 'string') ev.raw = raw['raw']
+  return ev
+}
+
+/**
+ * Parse a raw /ws/logs server frame. Returns null for malformed frames.
+ * Malformed single events inside a valid frame are skipped (like malformed
+ * telemetry samples) — logs have no resync mechanism to escalate to.
+ */
+export function parseLogsServerMsg(data: unknown): LogsServerMsg | null {
+  let raw: unknown = data
+  if (typeof data === 'string') {
+    try {
+      raw = JSON.parse(data)
+    } catch {
+      return null
+    }
+  }
+  if (!isRecord(raw)) return null
+  if (raw['t'] !== 'history' && raw['t'] !== 'events') return null
+  if (!Array.isArray(raw['events'])) return null
+  const events: LogEvent[] = []
+  for (const e of raw['events']) {
+    const ev = parseLogEvent(e)
+    if (ev !== null) events.push(ev)
+  }
+  return { t: raw['t'], events }
 }
 
 /** Parse a raw /ws/telemetry server frame. Returns null for malformed frames. */

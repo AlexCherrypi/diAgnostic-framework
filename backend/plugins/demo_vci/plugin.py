@@ -5,6 +5,12 @@ actions and three 20 Hz telemetry channels (sine V, noise rpm, sawtooth degC).
 
 Runs out-of-process, spawned by the core; talks JSON-RPC 2.0 over stdio via
 :mod:`diagcore.plugins.api`.
+
+M0.5 (SPEC 14.2): while a self-test job runs, the plugin simulates bus
+traffic — plausible UDS-ish request/response frame pairs reported via the
+``io`` notification (tx then rx, hex payloads, decoded dicts, one pair per
+job tick, i.e. ~10 io events/s at the default step duration) — so the raw
+feed is demonstrable without hardware.
 """
 
 from __future__ import annotations
@@ -100,6 +106,115 @@ async def telemetry_loop() -> None:
         await asyncio.sleep(period)
 
 
+def _emit_selftest_io(step_index: int, tick: int) -> None:
+    """One simulated UDS request/response pair (tx then rx) for a job tick."""
+    dev = device_id()
+    step_name = STEP_NAMES[step_index]
+    if step_index == 0:
+        # ReadDataByIdentifier: battery voltage
+        mv = int((12000 + 500 * math.sin(tick)) + random.uniform(-50, 50))
+        plugin.io(
+            dev,
+            "tx",
+            "22F442",
+            decoded={"service": "ReadDataByIdentifier", "serviceId": "0x22", "did": "0xF442"},
+            note=step_name,
+        )
+        plugin.io(
+            dev,
+            "rx",
+            f"62F442{mv:04X}",
+            decoded={
+                "service": "ReadDataByIdentifier",
+                "serviceId": "0x62",
+                "did": "0xF442",
+                "batteryVoltageMv": mv,
+            },
+        )
+    elif step_index == 1:
+        # TesterPresent keeps the bus transceiver talking
+        plugin.io(
+            dev,
+            "tx",
+            "3E00",
+            decoded={"service": "TesterPresent", "serviceId": "0x3E", "subFunction": "0x00"},
+            note=step_name,
+        )
+        plugin.io(
+            dev,
+            "rx",
+            "7E00",
+            decoded={"service": "TesterPresent", "serviceId": "0x7E", "subFunction": "0x00"},
+        )
+    elif step_index == 2:
+        # DiagnosticSessionControl: extended session
+        plugin.io(
+            dev,
+            "tx",
+            "1003",
+            decoded={"service": "DiagnosticSessionControl", "serviceId": "0x10", "session": "0x03"},
+            note=step_name,
+        )
+        plugin.io(
+            dev,
+            "rx",
+            "500300320190",
+            decoded={
+                "service": "DiagnosticSessionControl",
+                "serviceId": "0x50",
+                "session": "0x03",
+                "p2ServerMaxMs": 50,
+                "p2StarServerMaxMs": 4000,
+            },
+        )
+    else:
+        # ReadDTCInformation: report DTCs by status mask (none set)
+        plugin.io(
+            dev,
+            "tx",
+            "1902AF",
+            decoded={"service": "ReadDTCInformation", "serviceId": "0x19", "subFunction": "0x02", "statusMask": "0xAF"},
+            note=step_name,
+        )
+        plugin.io(
+            dev,
+            "rx",
+            "5902FF",
+            decoded={
+                "service": "ReadDTCInformation",
+                "serviceId": "0x59",
+                "subFunction": "0x02",
+                "availabilityMask": "0xFF",
+                "dtcCount": 0,
+            },
+        )
+
+
+def _emit_fail_io() -> None:
+    """The failing exchange preceding the simulated step-3 fault."""
+    dev = device_id()
+    plugin.io(
+        dev,
+        "tx",
+        "1003",
+        decoded={"service": "DiagnosticSessionControl", "serviceId": "0x10", "session": "0x03"},
+        note=STEP_NAMES[2],
+    )
+    plugin.io(
+        dev,
+        "rx",
+        "7F1031",
+        decoded={
+            "service": "NegativeResponse",
+            "serviceId": "0x7F",
+            "rejectedService": "0x10",
+            "nrc": "0x31",
+            "nrcName": "requestOutOfRange",
+        },
+        note="simulated fault",
+    )
+
+
 async def run_selftest(ctx: PluginJobContext, *, fail: bool = False) -> None:
     ticks = 10
     total = len(STEP_NAMES)
@@ -107,7 +222,9 @@ async def run_selftest(ctx: PluginJobContext, *, fail: bool = False) -> None:
         async with ctx.step(step_name):
             for tick in range(ticks):
                 if fail and step_index == 2 and tick == ticks // 2:
+                    _emit_fail_io()
                     raise RuntimeError("bus transceiver returned garbage")
+                _emit_selftest_io(step_index, tick)
                 await asyncio.sleep(STEP_SECONDS / ticks)
                 ctx.set_progress((step_index + (tick + 1) / ticks) / total)
 

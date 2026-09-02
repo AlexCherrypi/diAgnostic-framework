@@ -30,6 +30,12 @@ job engine semantics (job/step nodes, progress, sorted named locks,
 ``cancel`` action) using notifications. The named locks are plugin-local.
 This is the recorded M0 resolution of the SPEC 3.2/7-vs-6 contradiction —
 see the M0 notes in SPEC.md sections 3.2, 6 and 7.
+
+Job ids are ``<pluginNodeId>:job:<incarnation>.<n>``: the incarnation salt is
+drawn once per plugin process, so a job created after a crash/restart never
+reuses the id of a pre-crash job — the core's log ring keeps events (and
+their emit-time ancestry) across restarts, and a reused id would merge two
+unrelated jobs in a per-node raw feed (SPEC 14.4).
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import secrets
 import sys
 import threading
 import traceback
@@ -127,6 +134,8 @@ class Plugin:
         self._jobs: dict[str, _PluginJob] = {}
         self._finished_jobs: list[str] = []  # terminal job ids, oldest first
         self._job_counter = 0
+        #: Per-process-incarnation salt for job ids (see module docstring).
+        self._job_epoch = secrets.token_hex(4)
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
 
@@ -171,6 +180,32 @@ class Plugin:
 
     def log(self, level: str, message: str) -> None:
         self._notify("log", {"level": level, "message": message})
+
+    def io(
+        self,
+        node_id: str,
+        direction: str,
+        raw: str,
+        decoded: dict[str, Any] | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Report one raw vehicle frame (SPEC 14.2).
+
+        **Law:** every byte exchanged with a vehicle MUST be reported here —
+        this one-liner feeds the audit LogHub and the per-node raw feed.
+        ``direction`` is ``"tx"`` (written to the vehicle) or ``"rx"`` (read),
+        ``raw`` is the frame as whole bytes in hex — ``frame.hex()``: no
+        ``0x`` prefix, no separators (whitespace between bytes is tolerated),
+        even length — so the trail replays byte-exact; anything else is
+        dropped by the core with a ``warn`` event. ``decoded`` is an optional
+        structured interpretation, ``note`` an optional free-text remark.
+        """
+        params: dict[str, Any] = {"nodeId": node_id, "direction": direction, "raw": raw}
+        if decoded is not None:
+            params["decoded"] = decoded
+        if note is not None:
+            params["note"] = note
+        self._notify("io", params)
 
     def make_node(
         self,
@@ -220,10 +255,12 @@ class Plugin:
 
         Mirrors the core job engine: sorted lock acquisition with
         ``props.waitingFor``, running/done/error/cancelled transitions, and a
-        ``cancel`` action handled automatically by the API.
+        ``cancel`` action handled automatically by the API. The returned id is
+        unique per process incarnation (see module docstring), so LogHub
+        subtree filters never merge two jobs across a plugin restart.
         """
         self._job_counter += 1
-        job_id = f"{self.node_id}:job:{self._job_counter}"
+        job_id = f"{self.node_id}:job:{self._job_epoch}.{self._job_counter}"
         self.add(
             {
                 "id": job_id,

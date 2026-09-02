@@ -70,6 +70,26 @@ class StateTree:
             stack.extend(reversed(node.children))
         return result
 
+    def is_within(self, node_id: str | None, ancestor_id: str) -> bool:
+        """True if ``node_id`` exists and is ``ancestor_id`` or one of its
+        descendants — the membership half of :meth:`subtree_ids` in O(depth)
+        without materializing the subtree (hot path for plugin notifications).
+
+        Walks ``parentId`` upwards; the tree's own invariants (a parent must
+        exist on ``add``, ``parentId`` is never patched, ``remove`` pops whole
+        subtrees) guarantee no orphans or cycles. ``None`` / unknown ids are
+        never within anything.
+        """
+        current = node_id
+        while current is not None:
+            node = self._nodes.get(current)
+            if node is None:
+                return False
+            if current == ancestor_id:
+                return True
+            current = node.parentId
+        return False
+
     # -- subscriptions -----------------------------------------------------
 
     def subscribe(self, callback: PatchCallback) -> PatchCallback:

@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from diagcore.jobs import JobContext, JobEngine
+from diagcore.loghub import LogFilter, LogHub
 from diagcore.tree import StateTree
 
 from util import make_base_tree, wait_until
@@ -248,6 +249,83 @@ async def test_terminal_job_retention_cap(tree: StateTree) -> None:
         assert engine.get(old.id) is None
     for kept in jobs[2:]:
         assert tree.get(kept.id).status == "done"
+
+
+# -- job seam logging (SPEC 14.1) --------------------------------------------
+
+
+async def test_job_seam_logs_lifecycle_steps_and_milestones(tree: StateTree) -> None:
+    logs = LogHub(tree)
+    engine = JobEngine(tree, loghub=logs)
+
+    async def body(ctx: JobContext) -> None:
+        async with ctx.step("one"):
+            ctx.set_progress(0.3)
+        ctx.set_progress(0.6)
+        ctx.set_progress(0.8)
+
+    job = engine.create("demo", body, locks=["bus:x"])
+    await wait_until(lambda: status(tree, job.id) == "done", message="job done")
+
+    events = logs.history(LogFilter(categories=["job"]))
+    messages = [e["message"] for e in events]
+    # creation first, with the lock list (ids + values)
+    assert job.id in messages[0] and "'demo'" in messages[0] and "created" in messages[0]
+    assert "bus:x" in messages[0]
+    assert events[0]["data"] == {"jobId": job.id, "name": "demo", "locks": ["bus:x"]}
+    assert any("waiting for locks" in m and "bus:x" in m for m in messages)
+    assert any(m == f"job {job.id} 'demo' started" for m in messages)
+    # step lifecycle
+    assert any("step" in m and "'one'" in m and "started" in m for m in messages)
+    assert any("step" in m and "'one'" in m and "done" in m for m in messages)
+    # progress milestones at 25 % granularity (0.3 => 25 %, 0.6 => 50 %, 0.8 => 75 %)
+    assert any("progress 25%" in m for m in messages)
+    assert any("progress 50%" in m for m in messages)
+    assert any("progress 75%" in m for m in messages)
+    assert not any("progress 100%" in m for m in messages)  # covered by 'done'
+    assert f"job {job.id} 'demo' done" in messages[-1]
+    # step events carry the step node id and match a subtree filter on the job
+    by_job = [e["message"] for e in logs.history(LogFilter(nodeId=job.id, categories=["job"]))]
+    assert any(f"{job.id}:step:1" in m for m in by_job)
+
+
+async def test_job_seam_logs_failure(tree: StateTree) -> None:
+    logs = LogHub(tree)
+    engine = JobEngine(tree, loghub=logs)
+
+    async def bad(ctx: JobContext) -> None:
+        async with ctx.step("bad step"):
+            raise RuntimeError("exploded")
+
+    job = engine.create("failing", bad)
+    await wait_until(lambda: status(tree, job.id) == "error", message="job error")
+
+    errors = logs.history(LogFilter(categories=["job"], levels=["error"]))
+    messages = [e["message"] for e in errors]
+    assert any(f"{job.id}:step:1" in m and "exploded" in m for m in messages)  # failing step
+    assert any(m.startswith(f"job {job.id} 'failing' failed: exploded") for m in messages)
+    assert errors[-1]["data"]["error"]["message"] == "exploded"
+
+
+async def test_job_seam_logs_cancellation(tree: StateTree) -> None:
+    logs = LogHub(tree)
+    engine = JobEngine(tree, loghub=logs)
+    started = asyncio.Event()
+
+    async def slow(ctx: JobContext) -> None:
+        async with ctx.step("long"):
+            started.set()
+            await asyncio.sleep(30)
+
+    job = engine.create("cancellable", slow)
+    await started.wait()
+    assert engine.cancel(job.id)
+    await wait_until(lambda: status(tree, job.id) == "cancelled", message="job cancelled")
+
+    messages = [e["message"] for e in logs.history(LogFilter(categories=["job"], search="cancel"))]
+    assert any("cancellation requested" in m and job.id in m for m in messages)
+    assert any(m == f"job {job.id} 'cancellable' cancelled" for m in messages)
+    assert any(f"{job.id}:step:1" in m and "cancelled" in m for m in messages)
 
 
 async def test_shutdown_cancels_running_jobs(tree: StateTree, engine: JobEngine) -> None:

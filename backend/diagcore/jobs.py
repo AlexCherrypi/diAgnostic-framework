@@ -6,6 +6,10 @@ before the job starts; while waiting the job node stays ``init`` with
 ``props.waitingFor``. Cancellation is plain ``asyncio`` task cancellation and
 surfaces as status ``cancelled``. A job failure marks the failing step AND the
 job node ``error``; the engine itself never lets a job exception escape.
+
+M0.5 (SPEC 14.1): the engine is the job seam — the full lifecycle (creation,
+lock waits, start, steps, progress milestones at 25 % granularity,
+cancellation, errors, completion) is logged automatically, category ``job``.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Sequence
 
+from .loghub import LogHub, LogLevel
 from .model import Action, CmdResult, ErrorInfo, Node
 from .tree import StateTree
 
@@ -64,6 +69,7 @@ class _StepContext:
         )
         ctx._stack.append(step_id)
         self.id = step_id
+        ctx._log("info", f"job step {step_id} {self._name!r} started (job {ctx.job.id})", node_id=step_id)
         return self
 
     async def __aexit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> bool:
@@ -72,22 +78,32 @@ class _StepContext:
         assert self.id is not None
         if exc_type is None:
             ctx._tree.update(self.id, {"status": "done"})
+            ctx._log("info", f"job step {self.id} {self._name!r} done", node_id=self.id)
         elif issubclass(exc_type, asyncio.CancelledError):
             ctx._tree.update(self.id, {"status": "cancelled"})
+            ctx._log("info", f"job step {self.id} {self._name!r} cancelled", node_id=self.id)
         else:
             message = str(exc) or exc_type.__name__
             ctx._tree.update(self.id, {"status": "error", "error": {"message": message}})
+            ctx._log(
+                "error",
+                f"job step {self.id} {self._name!r} failed: {message}",
+                node_id=self.id,
+                data={"error": {"message": message}},
+            )
         return False  # always propagate
 
 
 class JobContext:
     """Handed to the job coroutine; creates steps and reports progress."""
 
-    def __init__(self, tree: StateTree, job: Job) -> None:
+    def __init__(self, tree: StateTree, job: Job, loghub: LogHub | None = None) -> None:
         self._tree = tree
         self.job = job
         self._stack: list[str] = [job.id]
         self._step_counter = 0
+        self._loghub = loghub
+        self._milestone = 0  # last logged progress quarter (0..4)
 
     def step(self, name: str) -> _StepContext:
         """``async with ctx.step("..."):`` — creates a running step node,
@@ -97,6 +113,27 @@ class JobContext:
     def set_progress(self, value: float) -> None:
         clamped = min(1.0, max(0.0, float(value)))
         self._tree.update(self.job.id, {"progress": clamped})
+        quarter = int(clamped * 4)
+        if quarter > self._milestone:
+            self._milestone = quarter
+            if quarter >= 1:
+                self._log(
+                    "info",
+                    f"job {self.job.id} {self.job.name!r} progress {quarter * 25}% ({clamped:.2f})",
+                    node_id=self.job.id,
+                    data={"progress": clamped},
+                )
+
+    def _log(
+        self,
+        level: LogLevel,
+        message: str,
+        *,
+        node_id: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        if self._loghub is not None:
+            self._loghub.emit(level, "job", message, node_id=node_id, data=data)
 
 
 class JobEngine:
@@ -106,13 +143,19 @@ class JobEngine:
         jobs_node_id: str = "jobs",
         *,
         retention: int = DEFAULT_JOB_RETENTION,
+        loghub: LogHub | None = None,
     ) -> None:
         self._tree = tree
         self._jobs_node_id = jobs_node_id
         self._retention = retention
+        self._loghub = loghub
         self._locks: dict[str, asyncio.Lock] = {}
         self._jobs: dict[str, Job] = {}
         self._counter = 0
+
+    def _log(self, level: LogLevel, message: str, *, node_id: str, data: dict[str, Any] | None = None) -> None:
+        if self._loghub is not None:
+            self._loghub.emit(level, "job", message, node_id=node_id, data=data)
 
     # -- public API --------------------------------------------------------
 
@@ -133,6 +176,12 @@ class JobEngine:
             index=0,
         )
         job = Job(id=job_id, name=name, lock_names=tuple(sorted(set(locks))))
+        self._log(
+            "info",
+            f"job {job_id} {name!r} created (locks={list(job.lock_names)})",
+            node_id=job_id,
+            data={"jobId": job_id, "name": name, "locks": list(job.lock_names)},
+        )
         job.task = asyncio.get_running_loop().create_task(
             self._run(job, coro_factory), name=f"diagcore-job-{job_id}"
         )
@@ -150,6 +199,7 @@ class JobEngine:
             return False
         if node.status not in _ACTIVE_STATUSES:
             return False
+        self._log("info", f"job {job_id} {job.name!r} cancellation requested", node_id=job_id)
         job.task.cancel()
         return True
 
@@ -182,9 +232,15 @@ class JobEngine:
 
     async def _run(self, job: Job, coro_factory: JobFactory) -> None:
         held: list[asyncio.Lock] = []
-        ctx = JobContext(self._tree, job)
+        ctx = JobContext(self._tree, job, self._loghub)
         try:
             if job.lock_names:
+                self._log(
+                    "debug",
+                    f"job {job.id} {job.name!r} waiting for locks {list(job.lock_names)}",
+                    node_id=job.id,
+                    data={"locks": list(job.lock_names)},
+                )
                 self._tree.merge_props(job.id, {"waitingFor": list(job.lock_names)})
                 for lock_name in job.lock_names:
                     lock = self._locks.setdefault(lock_name, asyncio.Lock())
@@ -192,10 +248,13 @@ class JobEngine:
                     held.append(lock)
                 self._tree.merge_props(job.id, {"waitingFor": []})
             self._tree.update(job.id, {"status": "running", "progress": 0.0})
+            self._log("info", f"job {job.id} {job.name!r} started", node_id=job.id)
             await coro_factory(ctx)
             self._safe_update(job.id, {"status": "done", "progress": 1.0, "actions": []})
+            self._log("info", f"job {job.id} {job.name!r} done", node_id=job.id)
         except asyncio.CancelledError:
             self._safe_update(job.id, {"status": "cancelled", "actions": []})
+            self._log("info", f"job {job.id} {job.name!r} cancelled", node_id=job.id)
         except Exception as exc:
             message = str(exc) or type(exc).__name__
             self._safe_update(
@@ -205,6 +264,12 @@ class JobEngine:
                     "error": {"message": message, "detail": traceback.format_exc()},
                     "actions": [],
                 },
+            )
+            self._log(
+                "error",
+                f"job {job.id} {job.name!r} failed: {message}",
+                node_id=job.id,
+                data={"error": {"message": message, "detail": traceback.format_exc()}},
             )
         finally:
             for lock in reversed(held):
