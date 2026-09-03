@@ -69,7 +69,7 @@ async def test_health_and_snapshot(core: AppCore) -> None:
         body = res.json()
         assert body["snapshot"]["rootId"] == "root"
         nodes = body["snapshot"]["nodes"]
-        assert set(nodes["root"]["children"]) == {"system", "plugins", "jobs"}
+        assert set(nodes["root"]["children"]) == {"system", "plugins", "jobs", "vehicle", "vehicles"}
         assert nodes["system"]["props"]["version"] == __version__
         assert nodes["system"]["props"]["pythonVersion"]
         assert nodes["system"]["props"]["startedAt"]
@@ -300,8 +300,9 @@ async def test_ws_state_sender_failure_closes_connection_instead_of_zombie(
     assert dropped[0]["data"]["endpoint"] == "/ws/state"
     assert "UnicodeEncodeError" in dropped[0]["message"]
     # the tree subscription was released: no subscriber leak for the dead client
-    # (only the state seam's own subscriber remains; bound methods compare by ==)
-    assert core.tree._subscribers == [core._log_state_patch]
+    # (only the state seam's and the vehicle session manager's permanent
+    # subscribers remain; bound methods compare by ==)
+    assert core.tree._subscribers == [core._log_state_patch, core.vehicles._on_patch]
 
 
 def test_serves_frontend_dist_when_present(core: AppCore, tmp_path: Path) -> None:

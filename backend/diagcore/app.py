@@ -1,10 +1,13 @@
 """Composition root: well-known nodes, job engine, telemetry hub, plugins.
 
-``AppCore`` wires the pieces together (SPEC 3.2, 7, 14): it builds the state
-tree with ``root`` / ``system`` / ``plugins`` / ``jobs``, owns the command bus,
-the job engine and the audit LogHub (SPEC 14.1 — every state patch is logged
-as category ``state`` at trace level via a tree subscription installed before
-any node exists), and loads every plugin found under ``backend/plugins/*``.
+``AppCore`` wires the pieces together (SPEC 3.2, 7, 14, 15): it builds the
+state tree with ``root`` / ``system`` / ``plugins`` / ``jobs`` / ``vehicle`` /
+``vehicles``, owns the command bus, the job engine, the audit LogHub (SPEC
+14.1 — every state patch is logged as category ``state`` at trace level via
+a tree subscription installed before any node exists), the vehicle profile
+store + session manager (SPEC 15; data dir ``<repo>/data`` or
+``DIAGCORE_DATA_DIR``), and loads every plugin found under
+``backend/plugins/*``.
 """
 
 from __future__ import annotations
@@ -26,10 +29,20 @@ from .plugins.host import PluginHost
 from .plugins.manifest import load_manifest
 from .telemetry import TelemetryHub
 from .tree import StateTree
+from .vehicles import (
+    LIBRARY_NODE_TYPE,
+    PROFILE_NODE_TYPE,
+    SESSION_NODE_TYPE,
+    VehicleSessionManager,
+    VehicleStore,
+    resolve_data_dir,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PLUGINS_DIR = Path(__file__).resolve().parent.parent / "plugins"
+
+_VEHICLE_NODE_TYPES = frozenset({SESSION_NODE_TYPE, LIBRARY_NODE_TYPE, PROFILE_NODE_TYPE})
 
 
 class AppCore:
@@ -39,6 +52,7 @@ class AppCore:
         plugins_dir: Path | str | None = None,
         plugin_env: dict[str, str] | None = None,
         log_dir: Path | str | None = None,
+        data_dir: Path | str | None = None,
     ) -> None:
         self.tree = StateTree()
         # LogHub first, subscribed before any node exists: even the well-known
@@ -64,7 +78,19 @@ class AppCore:
         self._plugin_env = plugin_env
         self._started = False
         self._started_monotonic: float | None = None
+        # Vehicle session (SPEC 15): the store persists profiles under
+        # <data dir>/vehicles, the manager owns the `vehicle` / `vehicles`
+        # nodes and drives the plugins' vehicle RPCs through their hosts.
+        self.data_dir = resolve_data_dir(data_dir)
+        self.vehicles = VehicleSessionManager(
+            self.tree,
+            VehicleStore(self.data_dir, loghub=self.logs),
+            self.hosts,
+            hub=self.hub,
+            loghub=self.logs,
+        )
         self._build_well_known_nodes()
+        self.vehicles.load_library()
         # SPEC 1.5 for the audit trail itself: a dead session file must show
         # up as an error on a node. Wire the one-shot report now (the
         # `system` node exists) and cover a failure that already happened
@@ -157,11 +183,14 @@ class AppCore:
                     # where the audit trail goes (SPEC 14.1); null if it could
                     # not be opened — see _mark_audit_sink_failure
                     "auditFile": self._session_file(),
+                    # where vehicle profiles are persisted (SPEC 15.1)
+                    "dataDir": str(self.data_dir),
                 },
             )
         )
         self.tree.add(Node(id="plugins", type="plugins", name="Plugins", status="idle", owner="core", parentId="root"))
         self.tree.add(Node(id="jobs", type="jobs", name="Jobs", status="idle", owner="core", parentId="root"))
+        self.vehicles.create_nodes()  # `vehicle` + `vehicles` (SPEC 3.2 / 15)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -174,6 +203,7 @@ class AppCore:
         self.logs.emit("info", "system", f"core starting: version={__version__}", node_id="system")
         await self.hub.start()
         self._load_plugins_from_disk()
+        self.vehicles.start()
         for host in self.hosts.values():
             await host.start()
 
@@ -184,6 +214,9 @@ class AppCore:
         await self.jobs.shutdown()
         for host in self.hosts.values():
             await host.stop()
+        # With the hosts gone, pending vehicle RPCs have failed fast: let the
+        # in-flight session transitions settle (bounded), then cancel leftovers.
+        await self.vehicles.shutdown()
         await self.hub.stop()
         uptime = time.monotonic() - (self._started_monotonic or time.monotonic())
         sink_error = self.logs.sink_error
@@ -247,6 +280,7 @@ class AppCore:
             )
             self.hosts[host.node_id] = host
             self.bus.register(host.owner, host.handle_command)
+            self.vehicles.attach_host(host)
             logger.info("configured plugin %s from %s", manifest.id, plugin_dir)
 
     def _add_broken_plugin_node(
@@ -283,6 +317,8 @@ class AppCore:
     async def _handle_core_command(self, node: Node, action: str, params: dict[str, Any]) -> CmdResult:
         if node.type == "job" or node.type.startswith("job."):
             return await self.jobs.handle_command(node, action, params)
+        if node.type in _VEHICLE_NODE_TYPES:
+            return await self.vehicles.handle_command(node, action, params)
         if node.type == "plugin":
             host = self.hosts.get(node.id)
             if host is not None and action == "restart":

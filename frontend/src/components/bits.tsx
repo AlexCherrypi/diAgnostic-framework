@@ -1,15 +1,13 @@
 /**
  * Small shared building blocks used by the node components:
- * progress bar, props table, action buttons (with pending/result state)
- * and the nested-children renderer.
+ * progress bar, props table, action buttons (the generic action form with
+ * pending/result state, see ActionForm.tsx) and the nested-children renderer.
  */
 
-import { useEffect } from 'react'
-import { clearCommandState, sendCommand, useCommandState } from '../lib/commands'
-import type { DiagNode, NodeAction } from '../lib/types'
+import { defaultVariant } from '../lib/actionform'
+import type { DiagNode } from '../lib/types'
 import { NodeRenderer } from '../registry/registry'
-
-const RESULT_FLASH_MS = 4000
+import { ActionControl } from './ActionForm'
 
 export function ProgressBar({
   value,
@@ -64,49 +62,22 @@ export function PropsTable({ props }: { props: Record<string, unknown> }) {
   )
 }
 
-function ActionButton({ node, action }: { node: DiagNode; action: NodeAction }) {
-  const cmd = useCommandState(node.id, action.name)
-  const pending = cmd?.status === 'pending'
-
-  // Clear finished results after a short flash.
-  useEffect(() => {
-    if (cmd === undefined || cmd.status === 'pending') return
-    const timer = window.setTimeout(
-      () => clearCommandState(node.id, action.name),
-      RESULT_FLASH_MS,
-    )
-    return () => window.clearTimeout(timer)
-  }, [cmd, node.id, action.name])
-
-  return (
-    <span className="action">
-      <button
-        type="button"
-        className="btn"
-        disabled={pending}
-        onClick={() => {
-          void sendCommand(node.id, action.name, {})
-        }}
-      >
-        {pending ? <span className="spinner spinner-inline" /> : null}
-        {action.label}
-      </button>
-      {cmd?.status === 'ok' ? <span className="action-result ok">ok</span> : null}
-      {cmd?.status === 'error' ? (
-        <span className="action-result err" title={cmd.error?.detail ?? undefined}>
-          {cmd.error?.message ?? 'failed'}
-        </span>
-      ) : null}
-    </span>
-  )
-}
-
-export function ActionButtons({ node }: { node: DiagNode }) {
+/**
+ * Every action of a node as an ActionControl (button, or button + inline
+ * form/confirm panel per SPEC 3.1.1). `primary` names the action rendered
+ * as the emphasized one (e.g. `select` on a vehicle profile).
+ */
+export function ActionButtons({ node, primary }: { node: DiagNode; primary?: string }) {
   if (node.actions.length === 0) return null
   return (
     <div className="actions">
       {node.actions.map((action) => (
-        <ActionButton key={action.name} node={node} action={action} />
+        <ActionControl
+          key={action.name}
+          target={node.id}
+          action={action}
+          variant={defaultVariant(action, primary)}
+        />
       ))}
     </div>
   )

@@ -24,11 +24,49 @@ export interface NodeError {
   detail?: string | null
 }
 
+// 3.1.1 Action parameters (M1.5)
+
+export type ActionParamType = 'string' | 'number' | 'boolean' | 'select'
+
+/** JSON primitive an action parameter carries (option values, defaults). */
+export type ActionParamValue = string | number | boolean
+
+export interface ActionParamOption {
+  /** what goes on the wire — never the label (SPEC 3.1.1) */
+  value: ActionParamValue
+  label: string
+}
+
+/** One input the UI collects before sending the command (SPEC 3.1.1). */
+export interface ActionParam {
+  name: string
+  label: string
+  type: ActionParamType
+  required: boolean
+  default: ActionParamValue | null
+  placeholder?: string
+  help?: string
+  /** number only */
+  min?: number
+  /** number only */
+  max?: number
+  /** select only */
+  options?: ActionParamOption[]
+  /**
+   * Conditional param (SPEC 3.1.1): collected, validated and sent only while
+   * every named `select` of the same action holds the given option value —
+   * how the detect form folds several plugins' params into one static form.
+   */
+  when?: Record<string, ActionParamValue>
+}
+
 export interface NodeAction {
   name: string
   label: string
-  /** Parameter descriptors — shape reserved by the spec, empty in M0. */
-  params: unknown[]
+  /** optional confirmation text — the UI asks before sending */
+  confirm?: string
+  /** inputs collected by the generic action form; empty ⇒ the UI sends `{}` */
+  params: ActionParam[]
 }
 
 export type NodeOwner = 'core' | `plugin:${string}`
@@ -180,7 +218,16 @@ export type TelemetryServerMsg = HistoryMsg | SamplesMsg
 export const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error'] as const
 export type LogLevel = (typeof LOG_LEVELS)[number]
 
-export const LOG_CATEGORIES = ['cmd', 'state', 'io', 'job', 'plugin', 'system'] as const
+/** `vehicle` (M1.5): session lifecycle, profile upserts, mount grants. */
+export const LOG_CATEGORIES = [
+  'cmd',
+  'state',
+  'io',
+  'job',
+  'plugin',
+  'system',
+  'vehicle',
+] as const
 export type LogCategory = (typeof LOG_CATEGORIES)[number]
 
 export interface LogEvent {
@@ -270,16 +317,81 @@ function normalizeError(v: unknown): NodeError | null {
   return { message, detail }
 }
 
+const ACTION_PARAM_TYPES: readonly ActionParamType[] = ['string', 'number', 'boolean', 'select']
+
+function asParamValue(v: unknown): ActionParamValue | null {
+  return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' ? v : null
+}
+
+/**
+ * Normalize one action parameter descriptor (SPEC 3.1.1), or null if it has
+ * no usable name. An unknown `type` degrades to a text field (the value still
+ * reaches the backend, which validates it); `min`/`max` are kept for numbers
+ * only and `options` for selects only, dropping options without a primitive
+ * value (nothing but the option value ever goes on the wire).
+ */
+function normalizeParam(raw: unknown): ActionParam | null {
+  if (!isRecord(raw) || typeof raw['name'] !== 'string' || raw['name'] === '') return null
+  const type = ACTION_PARAM_TYPES.includes(raw['type'] as ActionParamType)
+    ? (raw['type'] as ActionParamType)
+    : 'string'
+  const param: ActionParam = {
+    name: raw['name'],
+    label: asString(raw['label'], raw['name']),
+    type,
+    required: raw['required'] === true,
+    default: asParamValue(raw['default']),
+  }
+  if (typeof raw['placeholder'] === 'string' && raw['placeholder'] !== '') {
+    param.placeholder = raw['placeholder']
+  }
+  if (typeof raw['help'] === 'string' && raw['help'] !== '') param.help = raw['help']
+  if (type === 'number') {
+    if (typeof raw['min'] === 'number' && Number.isFinite(raw['min'])) param.min = raw['min']
+    if (typeof raw['max'] === 'number' && Number.isFinite(raw['max'])) param.max = raw['max']
+  }
+  if (type === 'select') {
+    const options: ActionParamOption[] = []
+    if (Array.isArray(raw['options'])) {
+      for (const o of raw['options']) {
+        if (!isRecord(o)) continue
+        const value = asParamValue(o['value'])
+        if (value === null) continue
+        options.push({ value, label: asString(o['label'], String(value)) })
+      }
+    }
+    param.options = options
+  }
+  if (isRecord(raw['when'])) {
+    const when: Record<string, ActionParamValue> = {}
+    for (const [key, v] of Object.entries(raw['when'])) {
+      const value = asParamValue(v)
+      if (key !== '' && value !== null) when[key] = value
+    }
+    if (Object.keys(when).length > 0) param.when = when
+  }
+  return param
+}
+
 function normalizeActions(v: unknown): NodeAction[] {
   if (!Array.isArray(v)) return []
   const out: NodeAction[] = []
   for (const a of v) {
     if (!isRecord(a) || typeof a['name'] !== 'string') continue
-    out.push({
+    const params: ActionParam[] = []
+    if (Array.isArray(a['params'])) {
+      for (const p of a['params']) {
+        const param = normalizeParam(p)
+        if (param !== null) params.push(param)
+      }
+    }
+    const action: NodeAction = {
       name: a['name'],
       label: asString(a['label'], a['name']),
-      params: Array.isArray(a['params']) ? a['params'] : [],
-    })
+      params,
+    }
+    if (typeof a['confirm'] === 'string' && a['confirm'] !== '') action.confirm = a['confirm']
+    out.push(action)
   }
   return out
 }

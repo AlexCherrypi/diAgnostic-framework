@@ -57,7 +57,9 @@ from .tree import StateTree
 logger = logging.getLogger(__name__)
 
 LogLevel = Literal["trace", "debug", "info", "warn", "error"]
-LogCategory = Literal["cmd", "state", "io", "job", "plugin", "system"]
+#: ``vehicle`` (M1.5, SPEC 14.1/15): session lifecycle, profile store changes,
+#: mount grants and revocations.
+LogCategory = Literal["cmd", "state", "io", "job", "plugin", "system", "vehicle"]
 
 DEFAULT_RING_SIZE = 50_000
 #: Ring byte budget (serialized JSON size; Python object overhead is roughly

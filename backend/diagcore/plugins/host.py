@@ -35,6 +35,21 @@ Plugin stdout lines whose JSON escapes materialize lone UTF-16 surrogates
 ``errors="surrogateescape"``) are not valid text: the host escapes them
 (``backslashreplace``) before they can reach the tree, the LogHub or a
 WebSocket, and audits the line.
+
+M1.5 (SPEC 15.4): **mount grants**. The host enforces SPEC 6 as "own subtree
+∪ granted subtrees": :meth:`PluginHost.grant` (implied by the outgoing
+``vehicle.detect`` / ``vehicle.attach`` requests) lets the plugin declare
+nodes under the core-owned session node, :meth:`PluginHost.revoke` (implied
+by ``vehicle.detach``) takes it back, and a plugin death revokes every grant
+(the next incarnation knows nothing about the session). The granted root
+itself stays core-owned: ``add`` may name it as ``parentId`` and ``io`` may
+report frames at it, but ``update`` / ``merge_props`` / ``remove`` of the
+root — or of anything under it the plugin did not declare — are dropped
+and logged like any other violation. Grants and revocations are logged
+(category ``vehicle``). The incoming ``vehicle.profile`` notification is
+validated against the SPEC 15.1 shape and must name a session the plugin
+currently holds a grant for — otherwise it is dropped and logged like any
+other bad notification.
 """
 
 from __future__ import annotations
@@ -46,7 +61,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable
 
 from pydantic import ValidationError
 
@@ -54,6 +69,7 @@ from ..loghub import LogCategory, LogHub, LogLevel, compact_json, sanitize_surro
 from ..model import Action, CmdResult, ErrorInfo, Node
 from ..telemetry import TelemetryHub
 from ..tree import StateTree
+from ..vehicles import VehicleProfileInput
 from .manifest import Manifest
 
 logger = logging.getLogger(__name__)
@@ -127,6 +143,7 @@ class PluginHost:
         restart_backoff: tuple[float, ...] = (1.0, 3.0, 10.0),
         max_restarts: int = 3,
         loghub: LogHub | None = None,
+        detach_timeout: float = 5.0,
     ) -> None:
         self.tree = tree
         self.hub = hub
@@ -145,8 +162,20 @@ class PluginHost:
         self._ping_timeout = ping_timeout
         self._init_timeout = init_timeout
         self._command_timeout = command_timeout
+        self._detach_timeout = detach_timeout
         self._backoff = restart_backoff
         self._max_restarts = max_restarts
+
+        #: Mount grants (SPEC 15.4): root ids of foreign subtrees the plugin
+        #: may currently mutate (the session node while it detects/attaches).
+        self._grants: set[str] = set()
+        #: Vehicle session seams (SPEC 15), wired by the session manager:
+        #: called when the plugin died (with the reason), when a new process
+        #: is up and the old subtree is gone, and for each valid
+        #: ``vehicle.profile`` notification.
+        self.on_plugin_died: Callable[[PluginHost, str], None] | None = None
+        self.on_plugin_respawned: Callable[[PluginHost], None] | None = None
+        self.on_vehicle_profile: Callable[[PluginHost, str, VehicleProfileInput], None] | None = None
 
         self._log = logging.getLogger(f"diagcore.plugin.{manifest.id}")
         self._proc: asyncio.subprocess.Process | None = None
@@ -211,6 +240,47 @@ class PluginHost:
     @property
     def restart_attempts(self) -> int:
         return self._attempts
+
+    # -- mount grants (SPEC 15.4) -------------------------------------------
+
+    @property
+    def grants(self) -> frozenset[str]:
+        """Root ids of the foreign subtrees this plugin may currently mutate."""
+        return frozenset(self._grants)
+
+    def has_grant(self, node_id: str) -> bool:
+        return node_id in self._grants
+
+    def grant(self, node_id: str, *, reason: str) -> None:
+        """Allow mutations under ``node_id`` (idempotent; logged)."""
+        if node_id in self._grants:
+            return
+        self._grants.add(node_id)
+        self._emit(
+            "info",
+            "vehicle",
+            f"mount grant {node_id} -> plugin {self.manifest.id} ({reason}); grants now {sorted(self._grants)}",
+            node_id=node_id,
+            data={"pluginId": self.manifest.id, "nodeId": node_id, "reason": reason, "grants": sorted(self._grants)},
+        )
+
+    def revoke(self, node_id: str, *, reason: str) -> None:
+        """Take a grant back (idempotent; logged when it existed)."""
+        if node_id not in self._grants:
+            return
+        self._grants.discard(node_id)
+        self._emit(
+            "info",
+            "vehicle",
+            f"mount grant {node_id} revoked from plugin {self.manifest.id} ({reason});"
+            f" grants now {sorted(self._grants)}",
+            node_id=node_id,
+            data={"pluginId": self.manifest.id, "nodeId": node_id, "reason": reason, "grants": sorted(self._grants)},
+        )
+
+    def revoke_all(self, reason: str) -> None:
+        for node_id in sorted(self._grants):
+            self.revoke(node_id, reason=reason)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -309,6 +379,125 @@ class PluginHost:
             ),
         )
 
+    # -- vehicle RPCs (SPEC 15.4) -------------------------------------------
+
+    def _vehicle_precheck(self) -> CmdResult | None:
+        if not self.manifest.is_vehicle_plugin:
+            return CmdResult(
+                ok=False,
+                error=ErrorInfo(message=f"plugin {self.manifest.id!r} has no 'vehicle' capability"),
+            )
+        if not self._healthy:
+            return CmdResult(ok=False, error=ErrorInfo(message=f"plugin {self.manifest.id!r} is not running"))
+        return None
+
+    async def _vehicle_request(self, method: str, params: dict[str, Any], timeout: float) -> CmdResult:
+        """Send one ``vehicle.*`` request; normalize ``{ok, jobNodeId?, error?}``
+        into a :class:`CmdResult` (``data.jobNodeId`` when the plugin gave
+        one). Never raises."""
+        rejected = self._vehicle_precheck()
+        if rejected is not None:
+            return rejected
+        try:
+            result = await asyncio.wait_for(self._request(method, params), timeout)
+        except PluginDiedError as exc:
+            return CmdResult(ok=False, error=ErrorInfo(message="plugin process died", detail=str(exc)))
+        except PluginRpcError as exc:
+            return CmdResult(ok=False, error=ErrorInfo(message=f"plugin rejected {method}: {exc}"))
+        except asyncio.TimeoutError:
+            return CmdResult(ok=False, error=ErrorInfo(message=f"{method} timed out after {timeout:g} s"))
+        if not isinstance(result, dict):
+            return CmdResult(ok=False, error=ErrorInfo(message=f"invalid {method} result: {result!r}"))
+        if result.get("ok") is True:
+            data: dict[str, Any] = {}
+            job_id = result.get("jobNodeId")
+            if job_id is not None:
+                if not isinstance(job_id, str) or not job_id:
+                    return CmdResult(
+                        ok=False,
+                        error=ErrorInfo(message=f"invalid {method} result: jobNodeId must be a non-empty string"),
+                    )
+                data["jobNodeId"] = job_id
+            return CmdResult(ok=True, data=data)
+        error = result.get("error")
+        if not isinstance(error, dict):
+            error = {"message": f"{method} failed"}
+        return CmdResult(
+            ok=False,
+            error=ErrorInfo(
+                message=str(error.get("message", f"{method} failed")),
+                detail=error.get("detail") if isinstance(error.get("detail"), str) else None,
+            ),
+        )
+
+    async def vehicle_detect(
+        self, session_node_id: str, params: dict[str, Any], *, timeout: float | None = None
+    ) -> CmdResult:
+        """``vehicle.detect {sessionNodeId, params}``; the mount grant for the
+        session node is implied (SPEC 15.4). ``data.jobNodeId`` on success.
+        ``timeout`` bounds the plugin's *answer* (the scan itself belongs in
+        the job); default: the generic command timeout."""
+        rejected = self._vehicle_precheck()
+        if rejected is not None:
+            return rejected
+        self.grant(session_node_id, reason="vehicle.detect")
+        return await self._vehicle_request(
+            "vehicle.detect",
+            {"sessionNodeId": session_node_id, "params": params},
+            self._command_timeout if timeout is None else timeout,
+        )
+
+    async def vehicle_attach(
+        self, session_node_id: str, profile: dict[str, Any], *, timeout: float | None = None
+    ) -> CmdResult:
+        """``vehicle.attach {sessionNodeId, profile}``; grant implied."""
+        rejected = self._vehicle_precheck()
+        if rejected is not None:
+            return rejected
+        self.grant(session_node_id, reason="vehicle.attach")
+        return await self._vehicle_request(
+            "vehicle.attach",
+            {"sessionNodeId": session_node_id, "profile": profile},
+            self._command_timeout if timeout is None else timeout,
+        )
+
+    async def vehicle_detach(self, session_node_id: str, *, timeout: float | None = None) -> CmdResult:
+        """``vehicle.detach {sessionNodeId}``. The grant is revoked whether or
+        not the plugin answers; no answer within ``timeout`` (default 5 s)
+        is logged as ``warn`` and the core proceeds (SPEC 15.4)."""
+        limit = self._detach_timeout if timeout is None else timeout
+        try:
+            result = await self._vehicle_request("vehicle.detach", {"sessionNodeId": session_node_id}, limit)
+        finally:
+            self.revoke(session_node_id, reason="vehicle.detach")
+        if not result.ok:
+            message = result.error.message if result.error else "unknown error"
+            self._emit(
+                "warn",
+                "vehicle",
+                f"vehicle.detach {session_node_id} by plugin {self.manifest.id} did not succeed: {message};"
+                " proceeding without the plugin's answer (grant revoked)",
+                node_id=session_node_id,
+                data={"pluginId": self.manifest.id, "nodeId": session_node_id, "result": result.model_dump(mode="json")},
+            )
+        return result
+
+    def _notify_died(self, reason: str) -> None:
+        callback = self.on_plugin_died
+        if callback is not None:
+            try:
+                callback(self, reason)
+            except Exception:
+                self._log.exception("on_plugin_died callback raised; continuing")
+
+    def _notify_respawned(self) -> None:
+        callback = self.on_plugin_respawned
+        if callback is not None:
+            try:
+                callback(self)
+            except Exception:
+                self._log.exception("on_plugin_respawned callback raised; continuing")
+
     # -- supervision -------------------------------------------------------
 
     async def _supervise(self) -> None:
@@ -324,6 +513,11 @@ class PluginHost:
                 data={"pluginId": self.manifest.id, "reason": reason},
             )
             self._mark_subtree_error(reason)
+            # A dead plugin holds no grants: its next incarnation knows
+            # nothing about the session (SPEC 15.4) — revoke, then let the
+            # session manager mark the session `lost`.
+            self.revoke_all(f"plugin died: {reason}")
+            self._notify_died(reason)
             self._attempts += 1
             if self._attempts > self._max_restarts:
                 self._log.error(
@@ -408,6 +602,7 @@ class PluginHost:
         # after `initialize`, and the stdout reader has not started yet, so
         # removing here is race-free.
         self._remove_declared_subtree()
+        self._notify_respawned()
         io_tasks = [
             loop.create_task(self._read_stdout(proc), name=f"diagcore-plugin-{self.manifest.id}-stdout"),
             loop.create_task(self._read_stderr(proc), name=f"diagcore-plugin-{self.manifest.id}-stderr"),
@@ -515,9 +710,20 @@ class PluginHost:
         job-subtree log view would otherwise show a job running forever.
         Already-terminal jobs are flipped to ``error`` too (SPEC 6) but not
         re-reported as failures.
+
+        Plugin-owned nodes under a granted subtree (SPEC 15.4: ECUs, the
+        detection job under the session node) belong to the dead process just
+        as much as its own subtree and are marked the same way; the granted
+        root itself is core-owned and left to its owner.
         """
         error = {"message": "plugin process died", "detail": reason}
-        for node_id in self.tree.subtree_ids(self.node_id):
+        doomed = self.tree.subtree_ids(self.node_id)
+        for grant_root in sorted(self._grants):
+            for node_id in self.tree.subtree_ids(grant_root):
+                node = self.tree.get(node_id)
+                if node_id != grant_root and node is not None and node.owner == self.owner:
+                    doomed.append(node_id)
+        for node_id in doomed:
             node = self.tree.get(node_id)
             if node is None:
                 continue
@@ -718,6 +924,8 @@ class PluginHost:
                 self.hub.publish(params["channel"], params.get("samples") or [])
             elif method == "io":
                 self._notify_io(params)
+            elif method == "vehicle.profile":
+                self._notify_vehicle_profile(params)
             elif method == "log":
                 raw_level = str(params.get("level", "info")).lower()
                 text = str(params.get("message", ""))
@@ -738,11 +946,46 @@ class PluginHost:
             self._log.exception("dropped %r notification after unexpected error", method)
 
     def _in_subtree(self, node_id: Any) -> bool:
-        """Membership test for the plugin's own subtree, O(depth) and
-        allocation-free — this runs once per notification, including every
-        `io` frame at bus rate. An unhashable id raises TypeError, which
-        ``_handle_notification`` turns into a dropped notification."""
-        return self.tree.is_within(node_id, self.node_id)
+        """Membership test for "own subtree ∪ granted subtrees" (SPEC 6 as
+        extended by SPEC 15.4), O(depth) per root and allocation-free — this
+        runs once per notification, including every `io` frame at bus rate.
+        An unhashable id raises TypeError, which ``_handle_notification``
+        turns into a dropped notification.
+
+        Root-inclusive: used where the granted root itself is a legitimate
+        target — ``add.parentId`` (children are declared *under* the session
+        node) and ``io.nodeId`` (frames are reported *at* the vehicle).
+        """
+        if self.tree.is_within(node_id, self.node_id):
+            return True
+        return any(self.tree.is_within(node_id, root) for root in self._grants)
+
+    def _may_mutate(self, node_id: Any) -> str | None:
+        """Why an ``update`` / ``merge_props`` / ``remove`` of ``node_id`` is
+        refused (None when it is allowed). Own subtree: unchanged M0 rule.
+        Granted subtrees: strictly *below* the granted root — the root
+        itself (the session node) is core-owned (SPEC 15.2/15.4) — and only
+        nodes this plugin declared there (``owner`` stamped on ``add``)."""
+        if self.tree.is_within(node_id, self.node_id):
+            return None
+        for root in self._grants:
+            if node_id == root:
+                return f"node {node_id!r} is a granted root (core-owned); plugins may only mutate below it"
+            if self.tree.is_within(node_id, root):
+                node = self.tree.get(node_id)
+                if node is not None and node.owner != self.owner:
+                    return f"node {node_id!r} under granted root {root!r} is owned by {node.owner!r}, not this plugin"
+                return None
+        return f"node {node_id!r} is outside the plugin subtree"
+
+    def forget_nodes(self, node_ids: Iterable[str]) -> None:
+        """Bookkeeping for nodes removed from the tree (by the plugin's own
+        ``remove`` or by the core dropping a granted subtree with the
+        session, SPEC 15.4): telemetry rings and plugin-job milestone
+        tracking must not outlive the nodes."""
+        for node_id in node_ids:
+            self.hub.drop(node_id)
+            self._job_milestones.pop(node_id, None)
 
     def _notify_add(self, params: dict[str, Any]) -> None:
         raw = params.get("node")
@@ -764,8 +1007,9 @@ class PluginHost:
 
     def _notify_update(self, params: dict[str, Any]) -> None:
         node_id = params.get("id")
-        if not self._in_subtree(node_id):
-            self._drop_notification("update", f"node {node_id!r} is outside the plugin subtree", params)
+        refused = self._may_mutate(node_id)
+        if refused is not None:
+            self._drop_notification("update", refused, params)
             return
         changes = params.get("changes")
         if not isinstance(changes, dict):
@@ -776,8 +1020,9 @@ class PluginHost:
 
     def _notify_merge_props(self, params: dict[str, Any]) -> None:
         node_id = params.get("id")
-        if not self._in_subtree(node_id):
-            self._drop_notification("merge_props", f"node {node_id!r} is outside the plugin subtree", params)
+        refused = self._may_mutate(node_id)
+        if refused is not None:
+            self._drop_notification("merge_props", refused, params)
             return
         props = params.get("props")
         if not isinstance(props, dict):
@@ -786,18 +1031,16 @@ class PluginHost:
 
     def _notify_remove(self, params: dict[str, Any]) -> None:
         node_id = params.get("id")
-        if node_id == self.node_id or not self._in_subtree(node_id):
-            self._drop_notification(
-                "remove",
-                f"node {node_id!r} is the plugin node itself or outside the plugin subtree",
-                params,
-            )
+        if node_id == self.node_id:
+            self._drop_notification("remove", f"node {node_id!r} is the plugin node itself", params)
+            return
+        refused = self._may_mutate(node_id)
+        if refused is not None:
+            self._drop_notification("remove", refused, params)
             return
         removed_ids = self.tree.subtree_ids(node_id)
         self.tree.remove(node_id)
-        for removed_id in removed_ids:
-            self.hub.drop(removed_id)
-            self._job_milestones.pop(removed_id, None)
+        self.forget_nodes(removed_ids)
 
     def _notify_io(self, params: dict[str, Any]) -> None:
         """Raw vehicle I/O notification (SPEC 14.2): validate, feed the LogHub.
@@ -843,6 +1086,45 @@ class PluginHost:
             data={"direction": direction, "decoded": decoded, "note": note},
             raw=raw,
         )
+
+    def _notify_vehicle_profile(self, params: dict[str, Any]) -> None:
+        """``vehicle.profile {sessionNodeId, profile}`` (SPEC 15.4): the
+        session must be one the plugin holds a grant for, the profile must
+        have the SPEC 15.1 shape minus id/firstSeen/lastSeen; ``pluginId``
+        is stamped with this plugin (a different one is a plugin bug and
+        dropped). Anything else is dropped and logged."""
+        session_id = params.get("sessionNodeId")
+        if not isinstance(session_id, str) or session_id not in self._grants:
+            self._drop_notification(
+                "vehicle.profile",
+                f"sessionNodeId {session_id!r} is not a session this plugin holds a mount grant for"
+                f" (grants: {sorted(self._grants)})",
+                params,
+            )
+            return
+        raw = params.get("profile")
+        if not isinstance(raw, dict):
+            raise ValueError("vehicle.profile: missing profile object")
+        profile = VehicleProfileInput.model_validate(raw)
+        if profile.pluginId is not None and profile.pluginId != self.manifest.id:
+            raise ValueError(
+                f"vehicle.profile: pluginId {profile.pluginId!r} does not match this plugin ({self.manifest.id!r})"
+            )
+        profile = profile.model_copy(update={"pluginId": self.manifest.id})
+        self._emit(
+            "info",
+            "vehicle",
+            f"vehicle.profile from plugin {self.manifest.id} for {session_id}: name={profile.name!r}"
+            f" vin={profile.vin} ecus={len(profile.ecus)} identifiers={compact_json(profile.identifiers, 120)}",
+            source=self.owner,
+            node_id=session_id,
+            data={"sessionNodeId": session_id, "profile": profile.model_dump(mode="json")},
+        )
+        callback = self.on_vehicle_profile
+        if callback is None:
+            self._drop_notification("vehicle.profile", "no vehicle session manager is attached to this host", params)
+            return
+        callback(self, session_id, profile)
 
     # -- derived job auditing for plugin-declared jobs (M0 resolution) ------
 

@@ -36,6 +36,26 @@ export function useNode(id: string | null | undefined): DiagNode | undefined {
   return useMirrorStore((s) => (id ? s.nodes[id] : undefined))
 }
 
+/**
+ * The root's direct child of `type` — the well-known nodes of SPEC 3.2
+ * (`system`, `vehicle.session`, `vehicle.library`, …) are found by type, not
+ * by id, so ids stay opaque (SPEC 3.1).
+ */
+export function findRootChild(state: MirrorState, type: string): DiagNode | undefined {
+  const root = state.rootId !== null ? state.nodes[state.rootId] : undefined
+  if (root === undefined) return undefined
+  for (const childId of root.children) {
+    const child = state.nodes[childId]
+    if (child !== undefined && child.type === type) return child
+  }
+  return undefined
+}
+
+/** Subscribe to the root's direct child of `type` (see findRootChild). */
+export function useRootChild(type: string): DiagNode | undefined {
+  return useMirrorStore((s) => findRootChild(s, type))
+}
+
 // ---------------------------------------------------------------------------
 // Mutators — called exclusively by the /ws/state client (ws.ts).
 // ---------------------------------------------------------------------------

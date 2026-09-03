@@ -90,7 +90,8 @@ sending the command:
   "type": "string | number | boolean | select",
   "required": true, "default": null, "placeholder": "0x10", "help": "string?",
   "min": 0, "max": 255,                                        // number only
-  "options": [ { "value": "uds", "label": "UDS on CAN" } ] }   // select only
+  "options": [ { "value": "uds", "label": "UDS on CAN" } ],    // select only
+  "when": { "protocol": "uds" } }   // optional: in effect only while that select holds this value
 ```
 
 Rules: the UI sends `params` as `{ name: value }` using the option **value**,
@@ -98,6 +99,18 @@ never its label — so the audit trail (§14) records the raw value/id behind
 every dropdown choice. A non-empty `params` list opens the generic action
 form (§8); an action with `confirm` asks before sending; an action without
 params sends `{}`.
+
+`when` (optional, M1.5) makes a param **conditional**: every key names a
+`select` param of the same action, and the param is shown, validated
+(`required` included) and sent only while each named select holds the given
+option value — otherwise it is neither collected nor on the wire, and the
+core skips it in its own validation and default-filling. A `when` that
+references an unknown or non-select param, or a value that is not one of
+its options, is a declaration error (dropped and logged like any malformed
+node). Several params may share a name when their `when` conditions differ;
+a reference then resolves to the same-named select whose own `when` is
+compatible with the referencing condition. This is how the session's
+`detect` form folds several plugins' params into one static form (§15.2).
 
 Status semantics:
 
@@ -228,7 +241,11 @@ Core → plugin (requests):
 Plugin → core (notifications):
 - `add {node}` / `update {id, changes}` / `merge_props {id, props}` / `remove {id}`
   — mutations restricted to the plugin's own subtree **plus subtrees explicitly
-  granted to it (mount grants, §15.4)**; violations are logged and dropped
+  granted to it (mount grants, §15.4)**; violations are logged and dropped.
+  The granted root itself stays core-owned: `add` may name it as `parentId`
+  and `io` may report frames at it, but `update` / `merge_props` / `remove`
+  of the root — or of a node under it the plugin did not declare — are
+  violations
 - `samples {channel, samples: [[tMs, v], ...]}`
 - `log {level, message}`
 - `io {...}` (M0.5, §14.2) · `vehicle.profile {sessionNodeId, profile}` (M1.5, §15.4)
@@ -380,7 +397,8 @@ The core serves `frontend/dist` at `/` when it exists (single-process prod).
   profile store (detect a new vehicle vs. reuse a previously detected one),
   generic ECU-discovery flow, "probe arbitrary ECU" — as node types + generic
   components; plugins fill in the manufacturer-specific behavior.
-  **Specified in §15 — pulled ahead of M1 (next increment, backend 0.3.0).**
+  **Specified in §15, pulled ahead of M1. Implemented as of v0.3 (backend
+  `diagcore` 0.3.0).**
 - **M2**: persistence (sessions, recorded telemetry), bug-report export
   (zipped session logs).
 - **M3**: packaging/installer (Tauri or PyInstaller + pywebview), auto-update.
@@ -501,7 +519,7 @@ global log panel therefore never lets the last category be deselected.
 
 ---
 
-## 15. M1.5 — Generic vehicle session  ⚠ next increment (backend 0.3.0)
+## 15. M1.5 — Generic vehicle session  ✅ implemented as of v0.3 (backend `diagcore` 0.3.0)
 
 Manufacturer-agnostic answers to "which vehicle am I talking to?": detect a
 new vehicle, reuse a previously detected one, see its ECUs, probe an
@@ -534,12 +552,22 @@ Load errors mark the library node `error` (with action `reload`) — never
 crash the core. Every profile create/update/forget is logged (category
 `vehicle`) with the full profile in `data`.
 
+> **M1.5 resolution (recorded per the rule at the top of this file):** an
+> incoming profile that carries a VIN also matches a stored profile of the
+> same plugin that has **no** VIN yet but identical, non-empty
+> `identifiers` — so a VIN learned on a later `vehicle.profile` (§15.4)
+> does not fork the vehicle into two profiles. Consequence for plugin
+> authors: `identifiers` must be vehicle-unique per plugin (a layout
+> shared by many vehicles would merge them). The audit event of such an
+> upsert says so (`data.vinLearned: true`, `data.previousVin: null`, and
+> the message notes the learned VIN).
+
 ### 15.2 Session node `vehicle` (core-owned, type `vehicle.session`)
 
 props `{ state: "none | detecting | attaching | connected | lost", profileId,
 name, vin, pluginId, ecuCount, since }`. Status mapping: `idle` for
 none/connected, `running` for detecting/attaching, `error` for lost (plugin
-died or detach failed; `error` set).
+died; `error` set).
 
 Actions — only the applicable ones are present at any time:
 - `detect` (states none/connected/lost): params = `plugin` (select over the
@@ -547,6 +575,39 @@ Actions — only the applicable ones are present at any time:
   manifest `vehicle.detectParams`. Starts detection (§15.4).
 - `disconnect` (states detecting/attaching/connected/lost): cancels a running
   detect/attach, sends `vehicle.detach`, removes the session subtree.
+
+> **M1.5 resolution (recorded per the rule at the top of this file):** the
+> `detect` action is one static form, so with *several* capable plugins its
+> params are the required `plugin` select plus **every** capable plugin's
+> `detectParams`, each tagged `when: {plugin: <id>}` (§3.1.1; a
+> `detectParam` named `plugin`, or one whose `when` references `plugin`, is
+> a manifest error) — the generic form shows, validates and sends only the
+> selected plugin's params, so same-named params of different plugins never
+> clash and a required param of another plugin never blocks the form. The
+> core validates the values against the *selected* plugin's params, fills in
+> that plugin's defaults and forwards **exactly that plugin's declared
+> params** in `vehicle.detect` (anything else a client sent is dropped, so
+> the audited `params` are what the plugin received). With no capable plugin
+> running `detect` is still offered (empty params) and answers `ok:false`
+> with the reason — the UI never hides the way in. `detect`/`select` from
+> connected/lost first tear the current session down like `disconnect`. A
+> detect/attach that fails or is cancelled does **not** send
+> `vehicle.detach` (the plugin's job has already ended; the grant is revoked
+> and the subtree removed); `disconnect` does.
+>
+> `disconnect` always ends in `none`, never `lost`: a `vehicle.detach` that
+> answers `ok:false` or times out is logged `warn` (category `vehicle`, the
+> result in `data`) and the subtree is still removed and the grant revoked
+> (§15.4) — `lost` is reserved for a plugin that died, where the evidence
+> stays. A `disconnect` issued while the plugin has not yet answered
+> `vehicle.detect` / `vehicle.attach` pre-empts that wait at once (the start
+> command answers `ok:false` "abandoned", the disconnect `ok:true`), so a
+> hung plugin never makes Disconnect wait for an RPC timeout.
+>
+> Commands on the session run as core-owned transitions that a client's
+> command merely awaits: a client vanishing mid-command (page reload, stalled
+> socket) never leaves the session half-transitioned (§1.5) — the transition
+> completes and is logged as usual.
 
 Children: while detecting/attaching, the plugin's job (`job`/`job.step`)
 declared **under the session node** so progress, steps and the raw feed appear
@@ -581,19 +642,37 @@ Core → plugin requests:
   nodes under the session node as they are found, and finally sends
   `vehicle.profile`. If the job ends `error`/`cancelled`, the core returns the
   session to `none`, removes the subtree, revokes the grant, and logs why.
+  The job stays watched until it is terminal — also once an early
+  `vehicle.profile` already made the session `connected` (a late
+  error/cancel then ends the session the same way; `done` just stops the
+  watch); a job the plugin *removes* while watched counts as failed
+  ("vanished"). A detect answered without `jobNodeId` (synchronous
+  detection) must still deliver its `vehicle.profile` within the same short
+  grace period the core grants after a job's `done`, else it counts as
+  failed. If the job the plugin names is already terminal when the answer
+  is processed, the `detect`/`select` command itself answers `ok:false`.
 - `vehicle.attach {sessionNodeId, profile}` → `{ok, jobNodeId?, error?}`:
   re-declare the profile's `ecu` nodes (optionally after a short verification
   job) so a known vehicle is reused without a full scan; a mismatch is
   reported through the job's error and handled like a failed detect.
+- The *answer* to `vehicle.detect` / `vehicle.attach` is expected within
+  10 s (the scan itself belongs in the job); a plugin that does not answer
+  in time is treated like one that refused (session back to `none`,
+  logged). A `disconnect` issued meanwhile abandons the wait immediately
+  (§15.2).
 - `vehicle.detach {sessionNodeId}` → `{ok}`: the plugin releases the vehicle.
   The core removes the subtree and revokes the grant even if the plugin does
-  not answer (timeout 5 s ⇒ logged `warn`).
+  not answer (timeout 5 s ⇒ logged `warn`) or answers `ok:false`; the same
+  5 s bound applies to the job `cancel` a teardown sends first.
 
 Plugin → core notification:
 - `vehicle.profile {sessionNodeId, profile}` — profile per §15.1 without
-  `id`/`firstSeen`/`lastSeen` (the core fills them). The core upserts the
-  file, refreshes the library node and sets the session `connected` with
-  `profileId`. May be sent again later (more identifiers learned) ⇒ upsert.
+  `id`/`firstSeen`/`lastSeen` (the core fills them; a plugin that re-emits
+  the full profile it received in `vehicle.attach` may carry them along —
+  they are ignored, never a reason to drop the notification). The core
+  upserts the file, refreshes the library node and sets the session
+  `connected` with `profileId`. May be sent again later (more identifiers
+  learned) ⇒ upsert.
 
 `ecu` node (plugin-owned, type `ecu`): props `{ ecuId (= profile ecu id),
 address, protocol, … }`, status `idle` when reachable, `error` when not;
@@ -613,11 +692,16 @@ so the audit trail has target id, params and result for every one of them.
 - `EcuView` (type `ecu`): compact card — name, address, protocol, status,
   actions; the Raw expander comes from StatusFrame as everywhere.
 - **Generic action form** (§3.1.1): generated from `params` (text, number with
-  min/max, checkbox, select from options), validates `required`, sends
-  `{ name: value }`; `confirm` prompts first. Used by GenericNode and every
-  specific view alike.
+  min/max, checkbox, select from options), shows only the params in effect
+  (`when`), validates `required`, sends `{ name: value }`; `confirm` prompts
+  first. Used by GenericNode and every specific view alike. A finished
+  command result flashes briefly and is then dropped by the command layer
+  itself, so it never resurfaces on a control mounted later.
 - The `vehicle` node is the default selection on connect (instead of root), so
-  the first screen answers "which vehicle?".
+  the first screen answers "which vehicle?". An explicit selection whose
+  node leaves the tree (session subtree removed, plugin restart) is cleared,
+  not just shadowed — a node re-declared later under the same id never
+  hijacks the main panel without a click.
 
 ### 15.6 Demo plugin additions (fictive, manufacturer-free)
 

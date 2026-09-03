@@ -1,8 +1,25 @@
 {
     "id": "demo_vci",
     "name": "Demo VCI (simulated)",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "entry": "plugin.py",
     "python": "default",
-    "frontend": null
+    "frontend": null,
+    "capabilities": ["vehicle"],
+    "vehicle": {
+        "detectParams": [
+            {
+                "name": "depth",
+                "label": "Scan depth",
+                "type": "select",
+                "required": true,
+                "default": "quick",
+                "help": "quick: one request per address (~6 s); full: one request per protocol (UDS, KWP) per address (~12 s)",
+                "options": [
+                    { "value": "quick", "label": "Quick scan (~6 s)" },
+                    { "value": "full", "label": "Full scan (~12 s)" }
+                ]
+            }
+        ]
+    }
 }

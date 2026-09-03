@@ -1,0 +1,23 @@
+{
+    "id": "fake_vehicle",
+    "name": "Fake vehicle plugin",
+    "version": "0.0.1",
+    "entry": "plugin.py",
+    "capabilities": ["vehicle"],
+    "vehicle": {
+        "detectParams": [
+            {
+                "name": "depth",
+                "label": "Depth",
+                "type": "select",
+                "required": true,
+                "default": "quick",
+                "options": [
+                    { "value": "quick", "label": "Quick" },
+                    { "value": "full", "label": "Full" }
+                ]
+            },
+            { "name": "retries", "label": "Retries", "type": "number", "min": 0, "max": 5, "default": 1 }
+        ]
+    }
+}

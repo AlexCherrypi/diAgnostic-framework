@@ -7,9 +7,9 @@
  * connecting state while the socket retries in the background.
  */
 
-import { useMirrorStore } from './lib/store'
+import { useMirrorStore, useRootChild } from './lib/store'
 import { useEffectiveSelection } from './lib/selection'
-import type { ConnectionState, DiagNode } from './lib/types'
+import type { ConnectionState } from './lib/types'
 import { TreeExplorer } from './components/TreeExplorer'
 import { LogPanel, LogPanelToggle } from './components/LogPanel'
 import { NodeRenderer } from './registry/registry'
@@ -30,20 +30,8 @@ function ConnectionPill() {
   )
 }
 
-function useSystemNode(): DiagNode | undefined {
-  return useMirrorStore((s) => {
-    const root = s.rootId !== null ? s.nodes[s.rootId] : undefined
-    if (root === undefined) return undefined
-    for (const childId of root.children) {
-      const child = s.nodes[childId]
-      if (child !== undefined && child.type === 'system') return child
-    }
-    return undefined
-  })
-}
-
 function SystemInfo() {
-  const system = useSystemNode()
+  const system = useRootChild('system')
   if (system === undefined) return null
   const version = system.props['version']
   const python = system.props['pythonVersion']

@@ -21,6 +21,10 @@ import { GenericNode } from '../components/GenericNode'
 import { JobView } from '../components/JobView'
 import { DeviceView } from '../components/DeviceView'
 import { ChannelChart } from '../components/ChannelChart'
+import { VehicleSessionView } from '../components/VehicleSessionView'
+import { VehicleLibraryView } from '../components/VehicleLibraryView'
+import { VehicleProfileView } from '../components/VehicleProfileView'
+import { EcuView } from '../components/EcuView'
 
 export interface NodeComponentProps {
   node: DiagNode
@@ -32,6 +36,11 @@ const registry = new Map<string, NodeComponent>([
   ['job', JobView], // job.step resolves here via prefix
   ['device', DeviceView], // device.sim resolves here via prefix
   ['telemetry.channel', ChannelChart],
+  // M1.5 vehicle session (SPEC 15)
+  ['vehicle.session', VehicleSessionView],
+  ['vehicle.library', VehicleLibraryView],
+  ['vehicle.profile', VehicleProfileView],
+  ['ecu', EcuView], // ecu.* tool nodes (e.g. ecu.probe) resolve here via prefix
 ])
 
 /** Register or override a component for a node type (M1 plugin bundles hook in here). */

@@ -518,3 +518,45 @@ async def test_lone_surrogates_from_plugin_are_escaped_and_audited(tree: StateTr
         assert status(tree, NODE_ID) == "idle"
     finally:
         await host.stop()
+
+
+async def test_granted_root_and_foreign_nodes_are_protected(tree: StateTree, hub: TelemetryHub) -> None:
+    """SPEC 15.4 mount grants cover what lies *below* the granted root: the
+    root itself (the core-owned session node) and nodes the plugin did not
+    declare there are never mutable — dropped and audited (SPEC 6)."""
+    from diagcore.model import Node
+
+    logs = LogHub(tree)
+    tree.add(Node(id="vehicle", type="vehicle.session", name="Vehicle", status="idle", owner="core", parentId="root"))
+    tree.add(Node(id="vehicle:core", type="device.sim", name="Core-owned", status="idle", owner="core", parentId="vehicle"))
+    host = make_host(tree, hub, loghub=logs)
+    host.create_node()
+    host.grant("vehicle", reason="test")
+    # the plugin's own node under the grant (owner stamped by _notify_add)
+    host._notify_add({"node": {"id": "vehicle:mine", "type": "device.sim", "name": "Mine", "status": "idle", "parentId": "vehicle"}})
+    assert tree.get("vehicle:mine").owner == NODE_ID
+
+    before = tree.get("vehicle").model_dump(mode="json")
+    host._notify_update({"id": "vehicle", "changes": {"status": "done", "type": "hijacked", "props": {"state": "none"}}})
+    host._notify_merge_props({"id": "vehicle", "props": {"state": "connected"}})
+    host._notify_remove({"id": "vehicle"})
+    host._notify_update({"id": "vehicle:core", "changes": {"status": "error"}})
+    host._notify_remove({"id": "vehicle:core"})
+    assert tree.get("vehicle").model_dump(mode="json") == before
+    assert tree.get("vehicle:core").status == "idle"
+    dropped = logs.history(LogFilter(categories=["plugin"], levels=["warn"], search="dropped"))
+    assert [e["data"]["method"] for e in dropped] == ["update", "merge_props", "remove", "update", "remove"]
+    assert all("granted root (core-owned)" in e["message"] for e in dropped[:3])
+    assert all("owned by 'core', not this plugin" in e["message"] for e in dropped[3:])
+    # the plugin's own node below the root stays fully mutable, and io at the root is fine
+    host._notify_update({"id": "vehicle:mine", "changes": {"status": "running"}})
+    host._notify_merge_props({"id": "vehicle:mine", "props": {"x": 1}})
+    assert tree.get("vehicle:mine").status == "running" and tree.get("vehicle:mine").props == {"x": 1}
+    host._notify_io({"nodeId": "vehicle", "direction": "tx", "raw": "3e80"})
+    assert len(logs.history(LogFilter(categories=["io"]))) == 1
+    host._notify_remove({"id": "vehicle:mine"})
+    assert tree.get("vehicle:mine") is None and len(dropped) == 5
+    # without the grant nothing under the root is reachable any more
+    host.revoke("vehicle", reason="test")
+    host._notify_update({"id": "vehicle:core", "changes": {"status": "error"}})
+    assert "outside the plugin subtree" in logs.history(LogFilter(categories=["plugin"], levels=["warn"], search="dropped"))[-1]["message"]

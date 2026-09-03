@@ -18,13 +18,16 @@ async def test_well_known_nodes(tmp_path: Path) -> None:
     tree = core.tree
     assert tree.root_id == "root"
     assert tree.get("root").type == "root"
-    assert tree.get("root").children == ["system", "plugins", "jobs"]
+    assert tree.get("root").children == ["system", "plugins", "jobs", "vehicle", "vehicles"]
     assert tree.get("system").type == "system"
     assert tree.get("plugins").type == "plugins"
     assert tree.get("jobs").type == "jobs"
+    assert tree.get("vehicle").type == "vehicle.session"  # M1.5, SPEC 15.2
+    assert tree.get("vehicles").type == "vehicle.library"  # M1.5, SPEC 15.3
     props = tree.get("system").props
-    assert set(props) == {"version", "startedAt", "pythonVersion", "auditFile"}
+    assert set(props) == {"version", "startedAt", "pythonVersion", "auditFile", "dataDir"}
     assert props["auditFile"] == str(core.logs.session_path)  # where the trail goes (SPEC 3.2/14.1)
+    assert props["dataDir"] == str(core.data_dir)  # where profiles go (SPEC 15.1)
     assert tree.get("system").status == "idle"
 
 
@@ -149,7 +152,7 @@ async def test_state_patch_seam_logging(tmp_path: Path) -> None:
     including the well-known node adds at construction time."""
     core = AppCore(plugins_dir=tmp_path / "none", log_dir=tmp_path / "logs")
     adds = [e for e in core.logs.history(LogFilter(categories=["state"]))]
-    assert len(adds) >= 4  # root, system, plugins, jobs
+    assert len(adds) >= 6  # root, system, plugins, jobs, vehicle, vehicles
     assert all(e["level"] == "trace" for e in adds)
     assert any("state add root" in e["message"] for e in adds)
 

@@ -22,14 +22,24 @@ from diagcore.app import AppCore
 from diagcore.loghub import LogFilter
 from diagcore.server import create_app
 
-from util import apply_ops
+from util import apply_ops, wait_until
 
 PLUGIN_ID = "plugin:demo_vci"
 DEVICE_ID = f"{PLUGIN_ID}:device"
 CHANNEL_IDS = [f"{DEVICE_ID}:ch:{key}" for key in ("sine", "noise", "saw")]
+SESSION_ID = "vehicle"
+LIBRARY_ID = "vehicles"
+DEMO_VIN = "DEM0VEH1CLE000042"
 
 #: Speed the demo self-test up for the test run (4 steps x 0.4 s ~= 1.6 s).
 FAST_STEP_SECONDS = "0.4"
+#: ...and the vehicle session flows (SPEC 15.6 timings are for humans).
+FAST_VEHICLE_ENV = {
+    "DEMO_VCI_DETECT_SECONDS": "1.0",
+    "DEMO_VCI_ATTACH_SECONDS": "0.4",
+    "DEMO_VCI_READ_IDS_SECONDS": "0.2",
+    "DEMO_VCI_PROBE_TIMEOUT_SECONDS": "0.3",
+}
 
 
 class StateClient:
@@ -107,7 +117,10 @@ class StateClient:
 @pytest.fixture
 async def running_server(monkeypatch, tmp_path) -> AsyncIterator[tuple[AppCore, int]]:
     monkeypatch.setenv("DEMO_VCI_STEP_SECONDS", FAST_STEP_SECONDS)
-    # default plugins dir => backend/plugins => demo_vci
+    for key, value in FAST_VEHICLE_ENV.items():
+        monkeypatch.setenv(key, value)
+    # default plugins dir => backend/plugins => demo_vci; the data dir comes
+    # from the autouse DIAGCORE_DATA_DIR fixture (never the repo's data/)
     core = AppCore(log_dir=tmp_path / "logs")
     app = create_app(core)
     config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="on")
@@ -138,9 +151,9 @@ async def test_full_state_flow(running_server: tuple[AppCore, int]) -> None:
         # -- hello snapshot -------------------------------------------------
         await client.recv_until(lambda c: c.seq is not None, what="hello")
         assert client.state["rootId"] == "root"
-        for well_known in ("root", "system", "plugins", "jobs"):
+        for well_known in ("root", "system", "plugins", "jobs", "vehicle", "vehicles"):
             assert well_known in client.nodes, f"missing well-known node {well_known}"
-        assert client.node("root")["children"] == ["system", "plugins", "jobs"]
+        assert client.node("root")["children"] == ["system", "plugins", "jobs", "vehicle", "vehicles"]
         assert PLUGIN_ID in client.nodes
         assert client.node(PLUGIN_ID)["parentId"] == "plugins"
 
@@ -386,6 +399,150 @@ async def test_plugin_crash_ends_running_job_and_restart_gets_fresh_job_ids(
         ]
         assert len(created) == 1  # the new job's feed is not merged with the pre-crash one
         assert core.logs.history(LogFilter(nodeId=second_job, categories=["job"], levels=["error"])) == []
+
+
+async def test_vehicle_session_flow_with_demo_plugin(running_server: tuple[AppCore, int], tmp_path) -> None:
+    """SPEC 15 end-to-end with the real demo plugin: detect => connected with
+    5 ECUs + profile file, probe known/unknown, read_ids, disconnect; then a
+    second core start on the same data dir lists the profile and attaches it
+    (select => attaching => connected) without a full scan."""
+    core, port = running_server
+    async with connect(f"ws://127.0.0.1:{port}/ws/state", max_size=8 * 1024 * 1024) as ws:
+        client = StateClient(ws)
+        await client.recv_until(
+            lambda c: c.node(DEVICE_ID).get("status") == "idle"
+            and c.node(SESSION_ID).get("actions")
+            and c.node(SESSION_ID)["actions"][0]["params"],
+            what="demo_vci declared and detect action ready",
+        )
+        vehicle = client.node(SESSION_ID)
+        assert vehicle["type"] == "vehicle.session" and vehicle["props"]["state"] == "none"
+        depth = vehicle["actions"][0]["params"][0]
+        assert vehicle["actions"][0]["name"] == "detect" and depth["name"] == "depth" and depth["type"] == "select"
+        assert [o["value"] for o in depth["options"]] == ["quick", "full"]
+        assert client.node(LIBRARY_ID)["type"] == "vehicle.library" and client.node(LIBRARY_ID)["children"] == []
+
+        # -- detect (quick) => detecting with the plugin's job under the session
+        cmd_id = await client.send_cmd(SESSION_ID, "detect", {"depth": "quick"})
+        result = await client.wait_result(cmd_id)
+        assert result["ok"] is True, result
+        job_id = result["data"]["jobNodeId"]
+        await client.recv_until(
+            lambda c: c.node(SESSION_ID)["props"]["state"] == "detecting" and c.node(job_id).get("status") == "running",
+            what="detecting with running job",
+        )
+        assert client.node(SESSION_ID)["status"] == "running"
+        assert client.node(job_id)["parentId"] == SESSION_ID and client.node(job_id)["owner"] == "plugin:demo_vci"
+        assert [a["name"] for a in client.node(SESSION_ID)["actions"]] == ["disconnect"]
+
+        # -- connected: 5 ECUs, the probe tool, profile props, library card, file
+        await client.recv_until(
+            lambda c: c.node(SESSION_ID)["props"]["state"] == "connected", timeout=30.0, what="connected"
+        )
+        props = client.node(SESSION_ID)["props"]
+        assert props["name"] == "Demo Vehicle" and props["vin"] == DEMO_VIN and props["pluginId"] == "demo_vci"
+        assert props["ecuCount"] == 5 and props["profileId"].startswith("veh_") and props["since"] > 1e12
+        # the profile precedes the job's own `done` (SPEC 15.4 order); the job stays visible while connected
+        await client.recv_until(lambda c: c.node(job_id).get("status") == "done", what="detection job done")
+        assert client.node(SESSION_ID)["props"]["state"] == "connected"
+        steps = job_steps(client, job_id)
+        assert [s["name"] for s in steps] == [
+            "Wake diagnostic bus",
+            "Scan addresses 0x00-0x7F",
+            "Read identification",
+            "Build profile",
+        ]
+        children = [client.node(cid) for cid in client.node(SESSION_ID)["children"]]
+        ecus = [n for n in children if n["type"] == "ecu"]
+        assert [e["name"] for e in ecus] == ["Engine ECU", "Airbag ECU", "Instrument Cluster", "Body Control Module", "Brake / ABS ECU"]
+        for ecu in ecus:
+            assert ecu["owner"] == "plugin:demo_vci" and ecu["status"] == "idle"
+            assert ecu["props"]["ecuId"] and ecu["props"]["address"].startswith("0x") and ecu["props"]["protocol"] in ("UDS", "KWP")
+            assert ecu["props"]["identification"]["vin"] == DEMO_VIN
+            assert [a["name"] for a in ecu["actions"]] == ["read_ids"]
+        tools = [n for n in children if n["type"] == "ecu.probe"]
+        assert len(tools) == 1 and tools[0]["name"] == "Probe ECU"
+        tool_id = tools[0]["id"]
+        probe_params = tools[0]["actions"][0]["params"]
+        assert tools[0]["actions"][0]["name"] == "probe"
+        assert [p["name"] for p in probe_params] == ["address", "protocol"]
+        assert probe_params[0]["type"] == "string" and probe_params[0]["required"] is True
+        assert probe_params[1]["type"] == "select" and [o["value"] for o in probe_params[1]["options"]] == ["UDS", "KWP"]
+        profile_id = props["profileId"]
+        card = client.node(f"vehicle:{profile_id}")
+        assert card["type"] == "vehicle.profile" and card["props"]["vin"] == DEMO_VIN and card["props"]["ecuCount"] == 5
+        assert client.node(LIBRARY_ID)["children"] == [f"vehicle:{profile_id}"]
+        profile_file = core.data_dir / "vehicles" / f"{profile_id}.json"
+        assert profile_file.is_file() and core.data_dir == tmp_path / "data"
+        stored = json.loads(profile_file.read_text(encoding="utf-8"))
+        assert stored["vin"] == DEMO_VIN and len(stored["ecus"]) == 5 and stored["pluginId"] == "demo_vci"
+        # the scan's raw frames landed on the session node's feed
+        scan_io = core.logs.history(LogFilter(nodeId=SESSION_ID, categories=["io"]))
+        assert len(scan_io) > 128  # 128 requests + the answers
+        assert sum(1 for e in scan_io if e["data"]["direction"] == "rx") >= 5
+
+        # -- probe: known address answers, unknown one times out => ok:false
+        cmd_id = await client.send_cmd(tool_id, "probe", {"address": "0x10", "protocol": "UDS"})
+        result = await client.wait_result(cmd_id)
+        assert result["ok"] is True, result
+        assert result["data"]["ecuId"] == "engine" and result["data"]["identification"]["vin"] == DEMO_VIN
+        cmd_id = await client.send_cmd(tool_id, "probe", {"address": "0x2A", "protocol": "UDS"})
+        result = await client.wait_result(cmd_id)
+        assert result["ok"] is False and "no response from 0x2A (UDS)" in result["error"]["message"]
+        cmd_id = await client.send_cmd(tool_id, "probe", {"address": "zz", "protocol": "UDS"})
+        result = await client.wait_result(cmd_id)
+        assert result["ok"] is False and "invalid address" in result["error"]["message"]
+        probe_io = core.logs.history(LogFilter(nodeId=tool_id, categories=["io"]))
+        assert len(probe_io) >= 4 and probe_io[0]["data"]["direction"] == "tx"
+        await client.recv_until(lambda c: c.node(tool_id)["props"].get("lastProbe", {}).get("ok") is False, what="lastProbe")
+
+        # -- read_ids: a short job under the ECU node fills its props
+        engine_id = ecus[0]["id"]
+        cmd_id = await client.send_cmd(engine_id, "read_ids")
+        result = await client.wait_result(cmd_id)
+        assert result["ok"] is True and result["data"]["ecuId"] == "engine"
+        ids_job = result["data"]["jobId"]
+        await client.recv_until(lambda c: c.node(ids_job).get("status") == "done", timeout=15.0, what="read_ids done")
+        assert client.node(ids_job)["parentId"] == engine_id
+        assert client.node(engine_id)["props"]["lastReadMs"] > 1e12
+
+        # -- disconnect => none, subtree gone, grant revoked; the library keeps the card
+        cmd_id = await client.send_cmd(SESSION_ID, "disconnect")
+        result = await client.wait_result(cmd_id)
+        assert result["ok"] is True, result
+        await client.recv_until(
+            lambda c: c.node(SESSION_ID)["props"]["state"] == "none" and not c.node(SESSION_ID)["children"],
+            what="session none",
+        )
+        assert core.hosts[PLUGIN_ID].grants == frozenset()
+        assert client.node(LIBRARY_ID)["children"] == [f"vehicle:{profile_id}"]
+        vehicle_events = core.logs.history(LogFilter(categories=["vehicle"]))
+        assert any("none -> detecting" in e["message"] for e in vehicle_events)
+        assert any("detecting -> connected" in e["message"] for e in vehicle_events)
+        assert any("connected -> none" in e["message"] for e in vehicle_events)
+
+    # -- second core start on the same data dir: known vehicle => attach path
+    core2 = AppCore(log_dir=tmp_path / "logs2", data_dir=core.data_dir)
+    try:
+        assert core2.tree.get(LIBRARY_ID).children == [f"vehicle:{profile_id}"]
+        assert core2.tree.get(f"vehicle:{profile_id}").props["vin"] == DEMO_VIN
+        await core2.start()
+        await wait_until(lambda: core2.hosts[PLUGIN_ID].healthy, timeout=15.0, message="demo plugin healthy in core2")
+        result = await core2.bus.dispatch(f"vehicle:{profile_id}", "select", {})
+        assert result.ok, result.error
+        assert core2.tree.get(SESSION_ID).props["state"] == "attaching"
+        attach_job = core2.tree.get(result.data["jobNodeId"])
+        assert attach_job.name == "Verify ECUs present" and attach_job.parentId == SESSION_ID
+        await wait_until(
+            lambda: core2.tree.get(SESSION_ID).props["state"] == "connected", timeout=15.0, message="attached"
+        )
+        node = core2.tree.get(SESSION_ID)
+        assert node.props["ecuCount"] == 5 and node.props["profileId"] == profile_id and node.props["vin"] == DEMO_VIN
+        assert core2.tree.get(f"vehicle:{profile_id}").props["lastSeen"] > stored["lastSeen"]
+        result = await core2.bus.dispatch(SESSION_ID, "disconnect", {})
+        assert result.ok and core2.tree.get(SESSION_ID).props["state"] == "none"
+    finally:
+        await core2.stop()
 
 
 async def test_telemetry_and_health(running_server: tuple[AppCore, int]) -> None:

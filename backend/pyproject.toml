@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diagcore"
-version = "0.2.0"
-description = "diAgnostic core backend (M0 skeleton + M0.5 audit logging & raw feeds)"
+version = "0.3.0"
+description = "diAgnostic core backend (M0 skeleton + M0.5 audit logging & raw feeds + M1.5 vehicle session)"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi",
